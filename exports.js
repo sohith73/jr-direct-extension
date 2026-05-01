@@ -1,11 +1,11 @@
 // --- Toggle here ---------------------------------------------------------
-const USE_LOCAL = true;
+const USE_LOCAL = false;
 
 // --- Production ----------------------------------------------------------
 const PROD = {
     API_BASE_URL: 'https://dashboard-api.flashfirejobs.com',
-    SCRAPER_BASE_URL: 'https://scraper.flashfirejobs.com',
-    CLIENTS_TRACKING_BASE_URL: 'https://hq.flashfirejobs.com',
+    SCRAPER_BASE_URL: 'http://34.100.143.80:8092',
+    CLIENTS_TRACKING_BASE_URL: 'https://clients-tracking-backend-580t.onrender.com',
 };
 
 // --- Local dev -----------------------------------------------------------
