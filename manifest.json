@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "FlashFire JR → Dashboard Direct",
-  "version": "1.7.1",
+  "version": "1.8.0",
   "description": "Scrape jobright.ai recommendations from the DOM as you scroll, AI-judge in-extension, hand jobIds to scraper backend for full-JD extraction, push picks straight to FlashFire dashboard.",
   "permissions": ["storage", "activeTab", "tabs", "scripting"],
   "host_permissions": [

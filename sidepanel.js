@@ -33,6 +33,12 @@ const els = {
     clientEmail: $('client-email'),
     logout: $('logout'),
 
+    // live activity bar
+    liveBar: $('live-bar'),
+    liveStage: $('live-stage'),
+    liveDetail: $('live-detail'),
+    liveCounts: $('live-counts'),
+
     // daily progress card
     dailyCard: $('daily-card'),
     dailyCount: $('daily-count'),
@@ -63,8 +69,12 @@ const els = {
 
     // stats
     count: $('count'),
+    captureCap: $('capture-cap'),
     picksCount: $('picks-count'),
     pushedCount: $('pushed-count'),
+    clientCapStat: $('client-cap-stat'),
+    capRemaining: $('cap-remaining'),
+    capTotal: $('cap-total'),
     linkedinSkippedCount: $('linkedin-skipped-count'),
     activeState: $('active-state'),
     phase: $('phase'),
@@ -109,6 +119,9 @@ let cfg = {
     operatorName: '',
     openaiKey: '',
 };
+// Capture cap mirrors background.js MAX_CAPTURES so labels stay in sync.
+const CAPTURE_CAP = 100;
+
 let captureCount = 0;
 let linkedinSkippedCount = 0;
 let captureActive = false;
@@ -295,6 +308,49 @@ function showMain() {
 // cap progress, and 14-day sparkline. Refreshed on showMain + after every
 // successful push. Server-truth, not local — survives SW eviction + dedup
 // edge-cases.
+// Live activity bar — single source of "what's happening right now".
+// Hides when idle, shows during auto-batch / judging / pushing. Counts
+// pill aggregate per-batch outcomes so operator sees rolling totals.
+const liveCounts = { pushed: 0, dupes: 0, blocked: 0 };
+let _liveResetTimer = null;
+function setLive(stage, detail, kind = 'active') {
+    if (!els.liveBar) return;
+    els.liveBar.hidden = false;
+    els.liveBar.classList.remove('success', 'error');
+    if (kind === 'success') els.liveBar.classList.add('success');
+    else if (kind === 'error') els.liveBar.classList.add('error');
+    if (els.liveStage) els.liveStage.textContent = stage || 'Working';
+    if (els.liveDetail) els.liveDetail.textContent = detail || '';
+    renderLiveCounts();
+    if (_liveResetTimer) { clearTimeout(_liveResetTimer); _liveResetTimer = null; }
+}
+function hideLive(delayMs = 0) {
+    if (!els.liveBar) return;
+    if (_liveResetTimer) clearTimeout(_liveResetTimer);
+    _liveResetTimer = setTimeout(() => {
+        els.liveBar.hidden = true;
+        els.liveBar.classList.remove('success', 'error');
+    }, delayMs);
+}
+function bumpLiveCount(kind) {
+    if (kind === 'pushed') liveCounts.pushed += 1;
+    else if (kind === 'duplicate') liveCounts.dupes += 1;
+    else if (kind === 'blocked' || kind === 'error') liveCounts.blocked += 1;
+    renderLiveCounts();
+}
+function resetLiveCounts() {
+    liveCounts.pushed = 0; liveCounts.dupes = 0; liveCounts.blocked = 0;
+    renderLiveCounts();
+}
+function renderLiveCounts() {
+    if (!els.liveCounts) return;
+    const parts = [];
+    if (liveCounts.pushed > 0) parts.push(`<span class="pill pushed">✓ ${liveCounts.pushed}</span>`);
+    if (liveCounts.dupes > 0)  parts.push(`<span class="pill dup">↺ ${liveCounts.dupes}</span>`);
+    if (liveCounts.blocked > 0) parts.push(`<span class="pill block">⊘ ${liveCounts.blocked}</span>`);
+    els.liveCounts.innerHTML = parts.join('');
+}
+
 let _dailyLoadInflight = null;
 let _dailyRefreshTimer = null;
 // Debounced refresh — auto-pipeline pushes can land in fast bursts; we
@@ -335,6 +391,21 @@ function renderDailyStats(history) {
     const cap = Number.isFinite(Number(history?.capInfo?.targetJobCount)) ? history.capInfo.targetJobCount : null;
     const remaining = Number.isFinite(Number(history?.capInfo?.remaining)) ? history.capInfo.remaining : null;
     const totalOps = history?.totals?.ops || 0;
+
+    // Mirror cap into the per-client stats tile so the operator never has
+    // to look in two places. Hide the tile when no cap is set.
+    if (els.clientCapStat) {
+        if (cap == null) {
+            els.clientCapStat.style.display = 'none';
+        } else {
+            els.clientCapStat.style.display = '';
+            const rem = remaining == null ? Math.max(0, cap - totalOps) : remaining;
+            if (els.capRemaining) els.capRemaining.textContent = String(rem);
+            if (els.capTotal) els.capTotal.textContent = `of ${cap}`;
+            els.clientCapStat.classList.toggle('over', rem <= 0);
+            els.clientCapStat.classList.toggle('warn', rem > 0 && (rem / cap) <= 0.2);
+        }
+    }
 
     // Densify last 14 days so missing rows render as empty bars.
     const today = new Date();
@@ -465,6 +536,11 @@ function applyState() {
     if (els.autoMode) els.autoMode.checked = cfg.autoMode !== false;
     if (els.autoBatchSize) els.autoBatchSize.value = String(cfg.autoBatchSize ?? 8);
     els.count.textContent = String(captureCount);
+    // Capture-cap color: amber at 80, red at 100.
+    if (els.count) {
+        els.count.classList.toggle('at-cap', captureCount >= CAPTURE_CAP);
+        els.count.classList.toggle('near-cap', captureCount >= 80 && captureCount < CAPTURE_CAP);
+    }
     els.linkedinSkippedCount.textContent = String(linkedinSkippedCount);
     els.activeState.textContent = captureActive ? 'YES' : 'no';
     els.statusDot.classList.toggle('active', !!captureActive);
@@ -870,6 +946,9 @@ async function doLogout() {
     if (els.dailyFill) els.dailyFill.style.width = '0%';
     if (els.dailySpark) els.dailySpark.innerHTML = '';
     if (els.dailyCap) els.dailyCap.textContent = '';
+    if (els.clientCapStat) els.clientCapStat.style.display = 'none';
+    if (els.liveBar) els.liveBar.hidden = true;
+    resetLiveCounts();
     showLogin();
 }
 
@@ -903,12 +982,14 @@ async function startCapture() {
     els.picksCount.textContent = '0';
     linkedinSkippedCount = 0;
     isJudged = false;
+    resetLiveCounts();
     const r = await send('jrd-start-capture');
     if (r?.ok) {
         captureActive = true;
         captureCount = 0;
         applyState();
         setMessage('Capture started. Open jobright.ai/jobs/recommend and scroll.', 'ok');
+        setLive('Capturing', 'Scroll JR — auto-pipeline kicks off every batch.');
     } else { setMessage('Failed to start capture.', 'error'); }
 }
 
@@ -994,6 +1075,8 @@ async function resetCapture() {
     rebuildList();
     applyState();
     setMessage('Capture cleared.');
+    if (els.liveBar) els.liveBar.hidden = true;
+    resetLiveCounts();
 }
 
 function toggleCardPick(jobId) {
@@ -1014,7 +1097,12 @@ chrome.runtime.onMessage.addListener((msg) => {
         case 'count':
             captureCount = msg.count;
             applyState();
-            if (msg.added > 0) setMessage(`+${msg.added} captured (total ${msg.count}).`, 'ok');
+            if (msg.added > 0) {
+                setMessage(`+${msg.added} captured (total ${msg.count}).`, 'ok');
+                if (captureActive) {
+                    setLive('Capturing', `${msg.count} job${msg.count === 1 ? '' : 's'} in buffer · scroll for more`);
+                }
+            }
             break;
         case 'linkedin-skip':
             linkedinSkippedCount = msg.count;
@@ -1027,36 +1115,68 @@ chrome.runtime.onMessage.addListener((msg) => {
             if (msg.phase === 'judging') {
                 setProcessing(true, `<span class="step">AI judging</span> ${msg.total} captured jobs…`);
                 pushTickerLine(`→ phase: judging (${msg.total} jobs)`, 'batch');
+                setLive('Judging', `Asking GPT to score ${msg.total} job${msg.total === 1 ? '' : 's'}…`);
             }
             if (msg.phase === 'pushing') {
                 setProgress(0, `<span class="step">Pushing</span> 0/${msg.toPush}…`);
                 pushTickerLine(`→ phase: pushing (${msg.toPush} picks)`, 'push');
+                setLive('Pushing', `Sending ${msg.toPush} pick${msg.toPush === 1 ? '' : 's'} to dashboard…`);
             }
             if (msg.phase === 'awaiting-resolve') {
                 setMessage('Waiting for full JD resolution to finish before push…', 'warn');
                 pushTickerLine('⏳ push paused — finishing full-JD resolve');
+                setLive('Awaiting JD', 'Scraper still extracting full job descriptions…');
             }
-            if (msg.phase === 'done') pushTickerLine(`✓ phase: done`);
+            if (msg.phase === 'done') {
+                pushTickerLine(`✓ phase: done`);
+                setLive('Done', 'Run complete.', 'success');
+                hideLive(2200);
+            }
+            if (msg.phase === 'cap-reached') {
+                captureActive = false;
+                applyState();
+                setMessage(`Capture cap reached (${msg.cap || CAPTURE_CAP}). Auto-stopped — pipeline will finish remaining picks.`, 'warn');
+                pushTickerLine(`⚑ cap reached — capture auto-stopped`, 'batch');
+                setLive('Cap reached', `${msg.cap || CAPTURE_CAP} captures — auto-stopping new ingest. Pipeline still draining…`, 'success');
+                hideLive(4500);
+            }
             break;
         case 'ai-batch-start': handleAiBatchStart(msg); break;
         case 'ai-progress': handleAiProgress(msg); break;
         case 'push-progress': handlePushProgress(msg); break;
         case 'decision': ingestDecision({ decision: msg.decision, job: msg.job }); break;
-        case 'push-start': ingestPushStart({ jobId: msg.jobId, title: msg.title, company: msg.company }); break;
+        case 'push-start':
+            ingestPushStart({ jobId: msg.jobId, title: msg.title, company: msg.company });
+            setLive(
+                'Pushing',
+                `${(msg.title || 'Untitled').slice(0, 60)} @ ${(msg.company || 'Unknown')}`,
+            );
+            break;
         case 'push-result':
             ingestPushResult({ jobId: msg.jobId, outcome: msg.outcome, detail: msg.detail });
+            bumpLiveCount(msg.outcome);
             if (msg.outcome === 'pushed') scheduleDailyRefresh();
             break;
         case 'auto-batch-start':
             pushTickerLine(`⚙ auto batch — ${msg.size} jobs → judging`, 'batch');
             ensureSectionVisible();
+            resetLiveCounts();
+            setLive('Auto batch', `Judging ${msg.size} captured job${msg.size === 1 ? '' : 's'} via OpenAI…`);
             break;
         case 'auto-batch-end':
             if (msg.error) {
                 pushTickerLine(`✗ auto batch error: ${msg.error}`, 'batch');
+                setLive('Batch error', String(msg.error), 'error');
+                hideLive(3500);
             } else if (msg.stats) {
                 const s = msg.stats;
                 pushTickerLine(`✓ auto totals — judged ${s.judged} · picks ${s.picks} · pushed ${s.pushed} · dupes ${s.dupes} · blocked ${s.blocked} · errors ${s.errors}`, 'batch');
+                setLive(
+                    'Batch done',
+                    `${s.picks} pick${s.picks === 1 ? '' : 's'} · ${s.pushed} pushed · ${s.dupes} dupe${s.dupes === 1 ? '' : 's'} · ${s.blocked} blocked`,
+                    'success',
+                );
+                hideLive(2500);
             }
             break;
         case 'applyurl-resolved': {

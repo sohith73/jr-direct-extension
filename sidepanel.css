@@ -349,6 +349,123 @@ input[type="search"]::-webkit-search-cancel-button { filter: invert(0.7); }
 .client-name { font-weight: 600; color: var(--fg); font-size: 13px; }
 .client-email { font-size: 11px; color: var(--fg-dim); }
 
+/* Generic small icon-only button — replaces the bloated ghost.icon
+   variant. Used for logout in the client bar. */
+.icon-btn {
+    flex: 0 0 auto;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--border);
+    color: var(--fg-dim);
+    cursor: pointer;
+    transition: background .15s ease, color .15s ease, border-color .15s ease;
+}
+.icon-btn:hover {
+    background: rgba(239, 68, 68, 0.12);
+    color: #fca5a5;
+    border-color: rgba(239, 68, 68, 0.4);
+}
+.icon-btn svg { width: 14px; height: 14px; display: block; }
+.icon-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+/* ---- live activity bar (auto-pipeline progress feedback) ---- */
+.live-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 10px 14px 0;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background:
+        linear-gradient(90deg, rgba(88, 166, 255, 0.08), rgba(34, 197, 94, 0.06)),
+        var(--bg-elevated);
+    border: 1px solid var(--border);
+    box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset;
+    position: relative;
+    overflow: hidden;
+}
+.live-bar::after {
+    /* Subtle moving sheen so operator visually sees "alive" even when
+       text doesn't update for a few seconds. */
+    content: "";
+    position: absolute;
+    top: 0; bottom: 0; left: -40%;
+    width: 40%;
+    background: linear-gradient(90deg, transparent, rgba(88, 166, 255, 0.10), transparent);
+    animation: liveSheen 2.4s linear infinite;
+    pointer-events: none;
+}
+@keyframes liveSheen {
+    0%   { transform: translateX(0); }
+    100% { transform: translateX(350%); }
+}
+.live-spinner {
+    flex: 0 0 auto;
+    width: 18px;
+    height: 18px;
+    border-radius: 999px;
+    border: 2px solid rgba(88, 166, 255, 0.25);
+    border-top-color: var(--accent);
+    animation: liveSpin 0.9s linear infinite;
+}
+@keyframes liveSpin { to { transform: rotate(360deg); } }
+.live-bar.success .live-spinner {
+    border-color: rgba(34, 197, 94, 0.3);
+    border-top-color: var(--green);
+    animation: none;
+}
+.live-bar.error .live-spinner {
+    border-color: rgba(239, 68, 68, 0.3);
+    border-top-color: var(--red);
+    animation: none;
+}
+.live-text { flex: 1; min-width: 0; }
+.live-stage {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--fg);
+}
+.live-detail {
+    font-size: 11.5px;
+    color: var(--fg-dim);
+    margin-top: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.live-counts {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 6px;
+}
+.live-counts .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 10.5px;
+    font-weight: 600;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid var(--border);
+    color: var(--fg-dim);
+    font-variant-numeric: tabular-nums;
+}
+.live-counts .pill.pushed { background: rgba(34,197,94,0.15); color: var(--green); border-color: var(--green-dim); }
+.live-counts .pill.dup    { background: rgba(212,160,23,0.12); color: var(--yellow); border-color: var(--yellow); }
+.live-counts .pill.block  { background: rgba(239,68,68,0.12); color: #fca5a5; border-color: rgba(239,68,68,0.35); }
+
 .preferred-section { padding: 0 14px; }
 .preferred-roles { display: flex; gap: 4px; flex-wrap: wrap; }
 
@@ -599,6 +716,23 @@ button.ghost.icon { padding: 7px 10px; font-size: 14px; }
 }
 .stat .big { font-size: 22px; font-weight: 700; color: var(--fg); line-height: 1; }
 .stat span:not(.big):not(.label) { font-size: 13px; font-weight: 500; }
+.stat .stat-cap {
+    font-size: 11px;
+    color: var(--fg-dim);
+    font-weight: 500;
+    margin-top: 2px;
+    font-variant-numeric: tabular-nums;
+}
+/* Capture stat near the cap → amber. Beyond → red. */
+.stat .big.near-cap { color: var(--yellow); }
+.stat .big.at-cap   { color: var(--red); }
+/* Per-client cap-remaining tile — emerald accent (positive remaining) */
+.stats .client-cap-stat .big { color: var(--green); }
+.stats .client-cap-stat.warn .big { color: var(--yellow); }
+.stats .client-cap-stat.over .big { color: var(--red); }
+.stats .client-cap-stat .label { color: var(--green); opacity: 0.8; }
+.stats .client-cap-stat.warn .label { color: var(--yellow); }
+.stats .client-cap-stat.over .label { color: var(--red); }
 
 /* ---- progress ---- */
 .progress-section {

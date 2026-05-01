@@ -197,16 +197,41 @@ function notifyPopup(type, payload) {
 
 // ---- capture handling ----------------------------------------------------
 
+// Hard cap on captures per session. Beyond this we stop ingesting so the
+// auto-pipeline finishes the existing buffer cleanly. Operator can Reset
+// to start a fresh session.
+const MAX_CAPTURES = 100;
+
 function ingestCards(jobs) {
     if (!state.capture.active) return;
     let added = 0;
+    let dropped = 0;
     for (const j of jobs || []) {
         if (!j?.jobId || state.capture.jobs.has(j.jobId)) continue;
+        if (state.capture.jobs.size >= MAX_CAPTURES) {
+            dropped += 1;
+            continue;
+        }
         state.capture.jobs.set(j.jobId, j);
         added += 1;
     }
     setBadge(state.capture.jobs.size);
-    notifyPopup('count', { count: state.capture.jobs.size, added });
+    notifyPopup('count', {
+        count: state.capture.jobs.size,
+        added,
+        dropped,
+        cap: MAX_CAPTURES,
+        atCap: state.capture.jobs.size >= MAX_CAPTURES,
+    });
+    if (state.capture.jobs.size >= MAX_CAPTURES) {
+        // Reaching cap auto-stops capture so the pipeline drains and the
+        // operator gets a clean "session done" signal.
+        if (state.capture.active) {
+            state.capture.active = false;
+            persistCapture();
+            notifyPopup('phase', { phase: 'cap-reached', cap: MAX_CAPTURES });
+        }
+    }
     if (added > 0) persistCapture();
     // Auto pipeline: kick a batch when enough unprocessed jobs accumulate.
     if (state.config.autoMode) tryAutoBatch();

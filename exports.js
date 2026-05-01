@@ -1,10 +1,3 @@
-// Hard-coded backend URLs + endpoints — edit this file to switch
-// environments (local dev vs prod). Mirrors DASH/jobTODashboard/exports.js
-// pattern so both extensions share the same config style.
-//
-// To run against local backends, swap API_BASE_URL / SCRAPER_BASE_URL
-// to localhost ports below and reload the extension.
-
 // --- Toggle here ---------------------------------------------------------
 const USE_LOCAL = true;
 

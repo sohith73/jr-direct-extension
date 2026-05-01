@@ -117,7 +117,25 @@
             <span class="client-name" id="client-name"></span>
             <span class="client-email" id="client-email"></span>
         </div>
-        <button id="logout" class="ghost icon" title="Log out + change client">⎋</button>
+        <button id="logout" class="icon-btn" title="Log out" aria-label="Log out">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+                <polyline points="16 17 21 12 16 7"/>
+                <line x1="21" y1="12" x2="9" y2="12"/>
+            </svg>
+        </button>
+    </section>
+
+    <!-- Live activity bar — visible during auto-pipeline runs so operator
+         sees what's happening (judge → resolve → push) instead of staring
+         at a static phase label. Hidden when idle. -->
+    <section class="row live-bar" id="live-bar" hidden>
+        <div class="live-spinner" aria-hidden="true"></div>
+        <div class="live-text">
+            <div class="live-stage" id="live-stage">Idle</div>
+            <div class="live-detail" id="live-detail"></div>
+        </div>
+        <div class="live-counts" id="live-counts"></div>
     </section>
 
     <!-- DAILY PROGRESS CARD — server-truth from /push-history?days=14 -->
@@ -205,9 +223,18 @@
     </section>
 
     <section class="row stats">
-        <div class="stat"><span class="label">Captured</span><span id="count" class="big">0</span></div>
+        <div class="stat" title="Capture cap is 100 per session.">
+            <span class="label">Captured</span>
+            <span id="count" class="big">0</span>
+            <span class="stat-cap" id="capture-cap">/ 100</span>
+        </div>
         <div class="stat"><span class="label">Picks</span><span id="picks-count" class="big">0</span></div>
         <div class="stat"><span class="label">Pushed</span><span id="pushed-count" class="big">0</span></div>
+        <div class="stat client-cap-stat" id="client-cap-stat" title="Server-side targetJobCount for this client. Updates after every push.">
+            <span class="label">Cap remaining</span>
+            <span id="cap-remaining" class="big">—</span>
+            <span class="stat-cap" id="cap-total"></span>
+        </div>
         <div class="stat skip-stat" title="LinkedIn-hosted jobs auto-skipped — operator policy"><span class="label">LinkedIn skipped</span><span id="linkedin-skipped-count" class="big">0</span></div>
         <div class="stat"><span class="label">Active</span><span id="active-state">no</span></div>
     </section>
