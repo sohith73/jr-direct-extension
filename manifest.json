@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "FlashFire JR → Dashboard Direct",
+  "version": "1.7.1",
+  "description": "Scrape jobright.ai recommendations from the DOM as you scroll, AI-judge in-extension, hand jobIds to scraper backend for full-JD extraction, push picks straight to FlashFire dashboard.",
+  "permissions": ["storage", "activeTab", "tabs", "scripting"],
+  "host_permissions": [
+    "https://jobright.ai/*",
+    "https://*.jobright.ai/*",
+    "https://api.openai.com/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Toggle FlashFire JR Panel"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://jobright.ai/*", "https://*.jobright.ai/*"],
+      "js": ["content-inject.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://jobright.ai/*", "https://*.jobright.ai/*"],
+      "js": ["content-scrape.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["sidepanel.html", "sidepanel.js", "sidepanel.css"],
+      "matches": ["https://jobright.ai/*", "https://*.jobright.ai/*"]
+    }
+  ]
+}

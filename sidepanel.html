@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>FlashFire JR → Dashboard</title>
+    <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+    <header>
+        <div class="title-row">
+            <h1>FlashFire JR → Dashboard</h1>
+            <span id="status-dot" class="dot" title="capture state"></span>
+        </div>
+        <div class="phase-row">
+            <span class="phase-label">Phase</span>
+            <span id="phase">idle</span>
+            <span class="batch-info" id="batch-info"></span>
+        </div>
+    </header>
+
+    <!-- ============ LOGIN VIEW ============ -->
+    <section id="login-view" class="login-view scroll-area" hidden>
+        <div class="login-card">
+            <div class="login-brand">
+                <div class="brand-logo">
+                    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M13 2L3 14h7v8l11-12h-7l-1-8z" fill="currentColor"/>
+                    </svg>
+                </div>
+                <div>
+                    <div class="brand-name">FlashFire</div>
+                    <div class="brand-tag">JR → Dashboard</div>
+                </div>
+            </div>
+
+            <h2 class="login-title">Welcome</h2>
+            <p class="login-subtitle">Sign in with the client's FlashFire dashboard credentials.</p>
+
+            <form id="login-form" autocomplete="off">
+                <div class="field">
+                    <label for="login-email">Client email</label>
+                    <div class="input-wrap">
+                        <svg class="input-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
+                            <polyline points="22,6 12,13 2,6"/>
+                        </svg>
+                        <input id="login-email" type="email" placeholder="client@example.com" required autocomplete="off">
+                    </div>
+                </div>
+                <div class="field">
+                    <label for="login-password">Password</label>
+                    <div class="input-wrap">
+                        <svg class="input-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                        </svg>
+                        <input id="login-password" type="password" placeholder="Enter password" required autocomplete="off">
+                        <button id="toggle-password" type="button" class="toggle-eye" aria-label="Show password">
+                            <svg class="eye-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                                <circle cx="12" cy="12" r="3"/>
+                            </svg>
+                            <svg class="eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" hidden>
+                                <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
+                                <line x1="1" y1="1" x2="23" y2="23"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+                <button id="login-submit" type="submit" class="login-btn">Sign in</button>
+                <div id="login-message" class="login-msg"></div>
+            </form>
+
+        </div>
+    </section>
+
+    <!-- ============ OPERATOR-CODE VIEW (after login, before main) ============ -->
+    <section id="code-view" class="login-view scroll-area" hidden>
+        <div class="login-card">
+            <div class="login-brand">
+                <div class="brand-logo">
+                    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M21 7l-3-3m0 0l-7 7-3-3-5 5 3 3 5-5 3 3 7-7z" fill="currentColor"/>
+                    </svg>
+                </div>
+                <div>
+                    <div class="brand-name">FlashFire</div>
+                    <div class="brand-tag">Operator Code</div>
+                </div>
+            </div>
+
+            <h2 class="login-title">Enter your code</h2>
+            <p class="login-subtitle">5-digit operator code issued by Ops. Used to tag every job you push.</p>
+
+            <form id="code-form" autocomplete="off">
+                <div class="field">
+                    <label for="code-input">Operator code</label>
+                    <div class="input-wrap">
+                        <svg class="input-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3"/>
+                        </svg>
+                        <input id="code-input" type="text" inputmode="numeric" pattern="\d{5}" maxlength="5" placeholder="00000" required>
+                    </div>
+                </div>
+                <button id="code-submit" type="submit" class="login-btn">Verify code</button>
+                <button id="code-back" type="button" class="ghost block">← Back to login</button>
+                <div id="code-message" class="login-msg"></div>
+            </form>
+        </div>
+    </section>
+
+    <!-- ============ MAIN VIEW (logged in) ============ -->
+    <div class="scroll-area" id="main-view" hidden>
+
+    <section class="row client-bar" id="client-bar">
+        <div class="client-bar-left">
+            <span class="client-name" id="client-name"></span>
+            <span class="client-email" id="client-email"></span>
+        </div>
+        <button id="logout" class="ghost icon" title="Log out + change client">⎋</button>
+    </section>
+
+    <!-- DAILY PROGRESS CARD — server-truth from /push-history?days=14 -->
+    <section class="row daily-card" id="daily-card">
+        <div class="daily-head">
+            <div class="daily-title-block">
+                <span class="daily-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/>
+                        <line x1="16" y1="2" x2="16" y2="6"/>
+                        <line x1="8" y1="2" x2="8" y2="6"/>
+                        <line x1="3" y1="10" x2="21" y2="10"/>
+                    </svg>
+                </span>
+                <div>
+                    <div class="daily-label">Added today</div>
+                    <div class="daily-sub" id="daily-sub">—</div>
+                </div>
+            </div>
+            <div class="daily-value">
+                <span id="daily-count" class="daily-num">0</span>
+                <span class="daily-cap" id="daily-cap"></span>
+            </div>
+        </div>
+        <div class="daily-progress">
+            <div class="daily-fill" id="daily-fill"></div>
+        </div>
+        <div class="daily-spark" id="daily-spark" aria-label="Last 14 days">
+            <!-- 14 day bars injected by sidepanel.js -->
+        </div>
+    </section>
+
+    <details class="config" id="config-details">
+        <summary>Settings</summary>
+        <div class="row">
+            <label for="ai-threshold" title="AI fit-score cutoff (0-100). Picks must score >=. Default 50.">AI fit threshold</label>
+            <input id="ai-threshold" type="number" min="0" max="100" step="5">
+        </div>
+        <div class="row">
+            <label for="auto-mode" title="When on: SW auto-judges every N captures, resolves JD via scraper, pushes picks to dashboard. No manual Push needed.">
+                <input id="auto-mode" type="checkbox"> Auto-pipeline
+            </label>
+            <small class="hint">Judge + resolve full JD + push to dashboard automatically as you scroll JR.</small>
+        </div>
+        <div class="row">
+            <label for="auto-batch-size" title="Trigger an auto-judge every N newly captured jobs.">Auto batch size</label>
+            <input id="auto-batch-size" type="number" min="1" max="40" step="1">
+        </div>
+        <div class="row info-block">
+            Backend URLs are pinned in <code>exports.js</code>. OpenAI key + model + candidate summary are managed in the Clients-Tracking portal.
+        </div>
+        <div class="row"><button id="save-config" class="primary block">Save settings</button></div>
+    </details>
+
+    <section class="row preferred-section" id="preferred-section">
+        <div class="preferred-roles" id="preferred-roles"></div>
+    </section>
+
+    <section class="row summary-section" id="summary-section">
+        <div class="summary-head">
+            <div class="summary-title">
+                <span class="summary-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                        <polyline points="14 2 14 8 20 8"/>
+                        <line x1="9" y1="13" x2="15" y2="13"/>
+                        <line x1="9" y1="17" x2="14" y2="17"/>
+                    </svg>
+                </span>
+                <div class="summary-title-text">
+                    <h3>Candidate Brief</h3>
+                    <span class="summary-status" id="summary-status"></span>
+                </div>
+            </div>
+        </div>
+        <div class="summary-body" id="summary-body"></div>
+        <div class="summary-meta" id="summary-meta" hidden></div>
+    </section>
+
+    <section class="row actions">
+        <button id="start" class="primary">Start capture</button>
+        <button id="judge" class="primary green" disabled>Judge captured</button>
+        <button id="push" class="primary green" disabled hidden>Push <span id="push-count">0</span></button>
+        <button id="reset" class="ghost">Reset</button>
+    </section>
+
+    <section class="row stats">
+        <div class="stat"><span class="label">Captured</span><span id="count" class="big">0</span></div>
+        <div class="stat"><span class="label">Picks</span><span id="picks-count" class="big">0</span></div>
+        <div class="stat"><span class="label">Pushed</span><span id="pushed-count" class="big">0</span></div>
+        <div class="stat skip-stat" title="LinkedIn-hosted jobs auto-skipped — operator policy"><span class="label">LinkedIn skipped</span><span id="linkedin-skipped-count" class="big">0</span></div>
+        <div class="stat"><span class="label">Active</span><span id="active-state">no</span></div>
+    </section>
+
+    <section class="row progress-section" id="progress-section" hidden>
+        <div class="progress-wrap">
+            <div class="progress-bar" id="progress-bar"><div class="fill" id="progress-fill"></div></div>
+            <div class="progress-text" id="progress-text">Initialising…</div>
+        </div>
+        <div class="activity-ticker" id="activity-ticker"></div>
+    </section>
+
+    <section class="row" id="message-row">
+        <div id="message" class="message"></div>
+    </section>
+
+    <section class="row outcomes" id="outcomes-row" hidden>
+        <span class="chip pushed" id="chip-pushed">Pushed: 0</span>
+        <span class="chip duplicate" id="chip-dup">Dupes: 0</span>
+        <span class="chip blocked" id="chip-blocked">Blocked: 0</span>
+        <span class="chip error" id="chip-errors">Errors: 0</span>
+    </section>
+
+    <section class="row decisions-section" id="decisions-section" hidden>
+        <div class="section-header">
+            <h2>AI Decisions</h2>
+            <div class="filter-tabs">
+                <button class="tab active" data-filter="all">All <span class="count" id="tab-count-all">0</span></button>
+                <button class="tab" data-filter="pick">Picks <span class="count" id="tab-count-pick">0</span></button>
+                <button class="tab" data-filter="skip">Skips <span class="count" id="tab-count-skip">0</span></button>
+            </div>
+        </div>
+        <div id="decisions-list" class="decisions-list"></div>
+    </section>
+
+    </div><!-- /#main-view -->
+
+    <footer>
+        <a id="open-jr" href="https://jobright.ai/jobs/recommend" target="_blank" rel="noreferrer">
+            Open JR /jobs/recommend
+        </a>
+        <span class="processing-warn" id="processing-warn" hidden>⚠ processing</span>
+    </footer>
+
+    <script type="module" src="sidepanel.js"></script>
+</body>
+</html>
