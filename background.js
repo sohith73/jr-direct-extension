@@ -63,6 +63,13 @@ const state = {
         profile: null,
         aiSummary: '',
         stats: { judged: 0, picks: 0, pushed: 0, dupes: 0, blocked: 0, errors: 0 },
+        // Hard stop. Flips true on first server TARGET_REACHED reply OR
+        // when /push-history reports remaining=0. While true the SW refuses
+        // to fire new batches, refuses individual pushes, and auto-stops
+        // capture so the operator gets clear "cap hit" feedback instead of
+        // every push silently failing.
+        capHit: false,
+        capInfo: null, // { targetJobCount, current, remaining } from server
     },
 };
 
@@ -358,6 +365,11 @@ async function clientLogin({ email, password }) {
             ...(profileKey ? { openaiKey: profileKey } : {}),
         });
     } catch {}
+    // Fresh login → reset cap gate state for the new client + sync server-side
+    // remaining cap so the panel renders accurate counters from frame zero.
+    state.auto.capHit = false;
+    state.auto.capInfo = null;
+    refreshCapInfo().catch(() => {});
     return {
         ok: true,
         client: {
@@ -421,6 +433,11 @@ async function clientLogout() {
     state.capture.linkedinSkipped = new Map();
     state.judged = null;
     state.lastResult = null;
+    state.auto.capHit = false;
+    state.auto.capInfo = null;
+    state.auto.processed = new Set();
+    state.auto.profile = null;
+    state.auto.aiSummary = '';
     setBadge(0);
     try {
         await chrome.storage.local.remove([
@@ -440,8 +457,63 @@ async function reloadProfile() {
     const r = await getProfile(email);
     if (!r.ok) return r;
     state.config.authProfile = r.profile;
-    try { await chrome.storage.local.set({ authProfile: r.profile }); } catch {}
+    // Pull OpenAI key forward — it lives on the profile, and a portal-side
+    // edit must reach the SW without requiring a re-login.
+    const profileKey = (r.profile?.openaiKey || '').trim();
+    if (profileKey) state.config.openaiKey = profileKey;
+    try {
+        await chrome.storage.local.set({
+            authProfile: r.profile,
+            ...(profileKey ? { openaiKey: profileKey } : {}),
+        });
+    } catch {}
+    // Cap state changes whenever the operator (or auto-pipeline) pushes from
+    // another panel session — re-sync.
+    refreshCapInfo().catch(() => {});
     return { ok: true, profile: r.profile };
+}
+
+// refreshCapInfo: hits /push-history?days=1 to read capInfo.{targetJobCount,
+// currentOps, remaining}. Trips state.auto.capHit when remaining===0 so the
+// gate fires before the first /addjob round-trips a 403. Cheap call, cached
+// implicitly by the dashboard-side aggregation; safe to call on every login,
+// every panel reopen, every successful push.
+async function refreshCapInfo() {
+    const email = state.config.authEmail;
+    if (!email) return { ok: false, error: 'NOT_LOGGED_IN' };
+    const r = await dashboardFetch(`/push-history?email=${encodeURIComponent(email)}&days=1`);
+    if (!r.ok || !r.body?.success) {
+        return { ok: false, error: r.error || `HTTP_${r.status}`, message: r.errorDetail || 'push-history failed' };
+    }
+    const cap = r.body.capInfo || null;
+    state.auto.capInfo = cap;
+    const remaining = cap?.remaining;
+    const wasHit = state.auto.capHit;
+    if (Number.isFinite(remaining) && remaining <= 0) {
+        if (!wasHit) tripCapHit({ source: 'push-history', cap });
+    } else {
+        // Cap raised on the dashboard or new client logged in — clear stale flag.
+        state.auto.capHit = false;
+    }
+    return { ok: true, capInfo: cap };
+}
+
+// tripCapHit: single source of truth for "cap reached". Idempotent.
+// Triggers: server TARGET_REACHED reply, push-history remaining===0.
+// Side effects: stop capture, abort auto pipeline, notify popup so UI
+// renders the "Daily cap reached" banner + disables Start.
+function tripCapHit({ source, cap, message }) {
+    if (state.auto.capHit) return;
+    state.auto.capHit = true;
+    if (cap) state.auto.capInfo = cap;
+    state.capture.active = false;
+    persistCapture().catch(() => {});
+    console.warn('[FF-JRD] cap-hit tripped via', source, 'capInfo=', state.auto.capInfo);
+    notifyPopup('phase', {
+        phase: 'cap-hit',
+        capInfo: state.auto.capInfo,
+        message: message || 'Client target reached — pushes halted.',
+    });
 }
 
 async function listClients() {
@@ -938,14 +1010,32 @@ async function pushJob({ job, clientEmail, clientName }) {
 const SYSTEM_PROMPT = `You are a hiring-fit grader for a job-search assistant.
 For each job, decide whether it matches the candidate's profile.
 
+The user prompt contains a "## Candidate hard signals" block with the
+authoritative preferredRoles, experienceLevel, and preferredLocations
+pulled DIRECTLY from the client's onboarding profile. This is the
+ground truth — the candidate-brief / aiSummary may paraphrase, but if
+they conflict, the hard-signals block wins.
+
 Return STRICT JSON only — no prose, no markdown:
-{"decisions":[{"id":"<jobId>","pick":<true|false>,"score":<0-100>,"reason":"<200-280 chars>"}]}
+{"decisions":[{"id":"<jobId>","pick":<true|false>,"score":<0-100>,"reason":"<200-300 chars>","matchedRole":"<which preferredRole this maps to, or '' for skip>","skipKind":"<see below, '' for picks>"}]}
+
+skipKind enum (REQUIRED for every skip — empty string for picks):
+- "threshold"      → score >= 40 but < operator threshold (would pick on a looser bar)
+- "role-mismatch"  → job title's role family does not map to any preferredRole
+- "seniority-mismatch" → role family matches but seniority is 2+ levels off
+- "location-mismatch"  → outside preferredLocations + workModel forbids it
+- "auth-mismatch"  → requires citizenship/clearance candidate doesn't have
+- "company-blocked" → company name in excludedCompanies
+Pick the SINGLE biggest reason; do not stack. Used by the UI to color-code
+the skip border so the operator can scan failures at a glance.
 
 Scoring rules:
 - score 0-100 weighing: role family (40%), seniority alignment (25%),
   location/work-model fit (15%), skills/experience signals (15%),
   salary band (5%).
-- Pick when score >= the operator threshold passed in the user prompt.
+- Pick when score >= the operator threshold passed in the user prompt
+  AND the job title maps cleanly to one of the candidate's preferredRoles
+  (same family, see groupings below). If no preferredRole maps, force pick=false.
 - Skip when seniority is 4+ levels off (intern asked → VP role; senior → entry intern).
 - Treat Software Engineer / Backend / Frontend / Full-Stack / Platform / SRE
   / DevOps / Data / ML / AI / Mobile / Security / QA as ONE engineering family.
@@ -953,28 +1043,49 @@ Scoring rules:
   as the same family at different seniority.
 
 REASON QUALITY — every reason MUST:
-- Be 2-3 sentences, 200-280 chars total.
-- Name specific signals you used: role title vs candidate roles, exact
-  seniority levels, location vs preferred locations, salary if relevant,
-  H1B/work-auth status, any blocker.
-- For SKIPS: lead with the single biggest disqualifier ("Skip — senior PM
-  but candidate is entry-level (4+ levels off)") then a secondary signal.
-- For PICKS: name the strongest match factor first ("Strong fit — Senior
-  Backend Engineer matches candidate's preferred roles + remote-friendly
-  US role aligns with their work-from-anywhere preference"), then any caveat.
+- Be 2-3 sentences, 200-300 chars total.
+- Cite the EXACT preferredRole string the job maps to (or fails to map to).
+  Use the wording from the hard-signals block, e.g. "matches preferred role
+  'Backend Engineer'" — not generic phrasing.
+- Name candidate experienceLevel vs job seniority explicitly.
+- Name candidate preferredLocations vs job location/workModel explicitly.
+- For SKIPS: lead with the disqualifier and which preferredRole it failed
+  ("Skip — Sr Director PM is 3 levels above candidate's 'Associate PM' target;
+  also outside preferred locations [SF/NYC]").
+- For PICKS: lead with the matched preferredRole and seniority alignment
+  ("Strong fit for preferred role 'Backend Engineer' at mid-level — matches
+  candidate's 3-5 YOE band; remote-US covers their 'Remote' preference").
 
-NEVER write generic reasons like "good fit" or "not a match" — always cite a concrete factor.`;
+The "matchedRole" field MUST be populated for every pick with the verbatim
+preferredRole from the hard-signals block. Empty string for skips.
+
+NEVER write generic reasons like "good fit" or "not a match" — always cite
+a concrete preferredRole + seniority + location signal.`;
 
 function buildUserPrompt({ profile, jobs, threshold, aiSummary }) {
+    // Hard-signals block ALWAYS goes in, even when an aiSummary exists. The
+    // summary may paraphrase or compress the preferredRoles list — the model
+    // must cite the EXACT strings the dashboard stored, so the operator's
+    // pick reasons line up 1:1 with the profile they edit in clients-tracking.
+    const fmtList = (v) => {
+        if (Array.isArray(v)) return v.filter(Boolean);
+        if (typeof v === 'string') return v.split(/\s*[/|,]\s*|\s{2,}/).map((s) => s.trim()).filter(Boolean);
+        return [];
+    };
+    const preferredRoles = fmtList(profile?.preferredRoles);
+    const preferredLocations = fmtList(profile?.preferredLocations);
+    const hardSignals = {
+        preferredRoles: preferredRoles.length ? preferredRoles : '(not specified — fall back to summary)',
+        experienceLevel: profile?.experienceLevel || '(not specified)',
+        preferredLocations: preferredLocations.length ? preferredLocations : '(not specified)',
+        workAuth: profile?.usWorkEligibility || profile?.visaStatus || '(not specified)',
+        excludedCompanies: profile?.excludedCompanies || profile?.removedCompanies || [],
+    };
+    const hardSignalsBlock = `## Candidate hard signals (AUTHORITATIVE — quote these exact role strings in your reason)\n${JSON.stringify(hardSignals, null, 2)}\n`;
     const intentBlock = aiSummary
-        ? `## Candidate brief (authoritative — judge against THIS):\n${aiSummary}\n`
-        : `## Candidate intent (no AI summary built yet — using raw profile):\n${JSON.stringify({
-              roles: profile?.preferredRoles || '',
-              seniority: profile?.experienceLevel || '',
-              locations: profile?.preferredLocations || '',
-              workAuth: profile?.usWorkEligibility || profile?.visaStatus || '',
+        ? `## Candidate brief (use for nuance — but hard signals above win on conflict):\n${aiSummary}\n`
+        : `## Candidate raw profile (no AI summary built yet):\n${JSON.stringify({
               targetCompanies: profile?.targetCompanies || '',
-              excludedCompanies: profile?.excludedCompanies || profile?.removedCompanies || '',
           }, null, 2)}\n`;
     const slim = jobs.map((j) => ({
         id: j.jobId,
@@ -993,6 +1104,7 @@ function buildUserPrompt({ profile, jobs, threshold, aiSummary }) {
     }));
     return `Threshold: ${threshold}
 
+${hardSignalsBlock}
 ${intentBlock}
 ## Jobs to judge (one decision per id below):
 ${JSON.stringify(slim, null, 2)}`;
@@ -1052,12 +1164,24 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
         if (!parsed || !Array.isArray(parsed.decisions)) {
             return { ok: false, error: 'BAD_AI_JSON', message: content.slice(0, 400) };
         }
+        const VALID_SKIP_KINDS = new Set([
+            'threshold', 'role-mismatch', 'seniority-mismatch',
+            'location-mismatch', 'auth-mismatch', 'company-blocked',
+        ]);
         for (const d of parsed.decisions) {
+            const skipKindRaw = typeof d.skipKind === 'string' ? d.skipKind.trim() : '';
             const norm = {
                 id: d.id,
                 pick: d.pick === true,
                 score: Number.isInteger(d.score) ? d.score : 0,
                 reason: typeof d.reason === 'string' ? d.reason : '',
+                matchedRole: typeof d.matchedRole === 'string' ? d.matchedRole : '',
+                // Picks always emit '' skipKind. Skips fall back to 'threshold'
+                // when the model returns junk so the UI never shows an
+                // un-colored border.
+                skipKind: d.pick === true
+                    ? ''
+                    : (VALID_SKIP_KINDS.has(skipKindRaw) ? skipKindRaw : 'threshold'),
             };
             decisions.push(norm);
             // Stream each judged job into the side panel so the operator
@@ -1140,6 +1264,16 @@ async function ensureAutoProfile() {
 }
 
 async function autoPushOne(job, decision) {
+    if (state.auto.capHit) {
+        // Refuse — server would 403 anyway. Mark visually so operator sees
+        // why the pick didn't push.
+        state.auto.stats.blocked += 1;
+        notifyPopup('push-result', {
+            jobId: job.jobId, outcome: 'blocked',
+            detail: 'Client cap reached — push skipped',
+        });
+        return { outcome: 'blocked', code: 'CAP_HIT' };
+    }
     const detail = await resolveJobDetail(job.jobId);
     let applyUrl = job.applyUrl;
     let description = job.description || job.matchSummary || '';
@@ -1186,6 +1320,13 @@ async function autoPushOne(job, decision) {
         outcome = 'blocked';
         outcomeDetail = `${body.message} (${body.current}/${body.cap})`;
         state.auto.stats.blocked += 1;
+        // First TARGET_REACHED in this session arms the global gate so the
+        // remaining workers + future batches stop wasting round-trips.
+        tripCapHit({
+            source: 'addjob:TARGET_REACHED',
+            cap: { targetJobCount: body.cap, currentOps: body.current, remaining: 0 },
+            message: body.message,
+        });
     } else if (body?.error === 'BLOCKED_COMPANY' || body?.error === 'BLOCKED_LOCATION' || r.status === 403) {
         outcome = 'blocked';
         outcomeDetail = `${body?.error || `HTTP_${r.status}`}: ${body?.message || ''}`;
@@ -1272,6 +1413,10 @@ async function runAutoBatch(batch) {
 }
 
 function tryAutoBatch() {
+    if (state.auto.capHit) {
+        console.warn('[FF-JRD] auto: skip — capHit (client target reached)');
+        return;
+    }
     if (state.auto.running) {
         console.log('[FF-JRD] auto: skip — batch already running');
         return;
@@ -1303,6 +1448,7 @@ function tryAutoBatch() {
 // flushAutoBatch: drain whatever's pending regardless of size. Called on
 // stop-capture so a half-batch isn't stranded.
 async function flushAutoBatch() {
+    if (state.auto.capHit) return;
     if (!state.config.autoMode) return;
     if (state.auto.running) return;
     if (!state.config.authEmail || !state.config.openaiKey) return;
@@ -1442,6 +1588,11 @@ async function pushSelected({ jobIds }) {
             results.blocked.push({
                 jobId: j.jobId, title: j.title, company: j.company,
                 code: 'TARGET_REACHED', message: body.message,
+            });
+            tripCapHit({
+                source: 'pushSelected:TARGET_REACHED',
+                cap: { targetJobCount: body.cap, currentOps: body.current, remaining: 0 },
+                message: body.message,
             });
             // Cap reached — every remaining push will also fail. Stop early.
             notifyPopup('push-result', { jobId: j.jobId, outcome, detail: outcomeDetail });
@@ -1605,9 +1756,18 @@ function dispatchMessage(msg, _sender, sendResponse) {
                 running: state.auto.running,
                 processed: state.auto.processed.size,
                 stats: { ...state.auto.stats },
+                capHit: state.auto.capHit,
+                capInfo: state.auto.capInfo,
             },
             lastResult: state.lastResult,
         });
+        return true;
+    }
+
+    if (msg.type === 'jrd-refresh-cap') {
+        refreshCapInfo()
+            .then((r) => sendResponse(r))
+            .catch((e) => sendResponse({ ok: false, error: 'UNEXPECTED', message: e?.message || String(e) }));
         return true;
     }
 
@@ -1649,6 +1809,15 @@ function dispatchMessage(msg, _sender, sendResponse) {
     }
 
     if (msg.type === 'jrd-start-capture') {
+        if (state.auto.capHit) {
+            sendResponse({
+                ok: false,
+                error: 'CAP_HIT',
+                message: 'Client target reached — cannot start a new capture session. Raise the cap in Clients-Tracking → AI Summary tab.',
+                capInfo: state.auto.capInfo,
+            });
+            return true;
+        }
         state.capture.active = true;
         state.capture.startedAt = new Date().toISOString();
         state.capture.jobs = new Map();
@@ -1659,6 +1828,9 @@ function dispatchMessage(msg, _sender, sendResponse) {
         state.auto.profile = null;
         state.auto.aiSummary = '';
         state.auto.stats = { judged: 0, picks: 0, pushed: 0, dupes: 0, blocked: 0, errors: 0 };
+        // capHit is NOT reset here — it tracks server-side state, not session.
+        // Operator must raise the cap on the dashboard to clear it (refreshCapInfo
+        // re-runs on push success / panel reopen).
         setBadge(0);
         persistCapture();
         chrome.storage.session.remove(PERSIST_KEYS.judged).catch(() => {});
@@ -1675,6 +1847,16 @@ function dispatchMessage(msg, _sender, sendResponse) {
             })
             .catch(() => {});
         sendResponse({ ok: true });
+        return true;
+    }
+
+    if (msg.type === 'jrd-stop-capture') {
+        // Halt ingest but keep buffer + judged state. Auto-pipeline is allowed
+        // to drain whatever's pending so half-batches aren't stranded.
+        state.capture.active = false;
+        persistCapture().catch(() => {});
+        flushAutoBatch().catch(() => {});
+        sendResponse({ ok: true, count: state.capture.jobs.size });
         return true;
     }
 

@@ -128,6 +128,14 @@ let captureActive = false;
 let isProcessing = false;
 let isJudged = false;
 let isResolving = false;
+// Server-side client cap state. Mirrors background.js state.auto.{capHit,capInfo}.
+// When true the panel disables Start, paints a sticky banner, and refuses to
+// kick fresh capture sessions — pushes would 403 anyway.
+let capHit = false;
+let capInfoCache = null;
+// Summary fetch state — purely cosmetic; lets renderSummarySection paint a
+// "Refreshing…" placeholder while /get-profile is in flight on every panel open.
+let summaryRefreshing = false;
 let currentFilter = 'all';
 
 const decisionsMap = new Map();
@@ -299,9 +307,126 @@ function showMain() {
     renderClientBar();
     renderPreferredRoles();
     renderSummarySection();
+    renderCapHitBanner();
     // Pull today's count + 14-day sparkline. Fire-and-forget — UI shows
     // a friendly skeleton while it loads.
     loadDailyStats().catch((e) => console.warn('[FF-JRD] loadDailyStats failed', e?.message));
+    // Always-fresh profile (and therefore aiSummary). The cached authProfile
+    // can be stale: the operator may have rebuilt the summary in the
+    // clients-tracking portal between sessions, or another teammate may have
+    // edited the profile. Fetch on every panel open + refuse to grade against
+    // stale text.
+    refreshProfileFromServer().catch((e) =>
+        console.warn('[FF-JRD] refreshProfileFromServer failed', e?.message)
+    );
+    // Re-sync cap state on every open in case the operator pushed from another
+    // device / the dashboard cap got raised.
+    send('jrd-refresh-cap').then((r) => {
+        if (r?.ok) {
+            capInfoCache = r.capInfo || null;
+            capHit = !!(capInfoCache && Number.isFinite(capInfoCache.remaining) && capInfoCache.remaining <= 0);
+            renderCapHitBanner();
+            applyState();
+        }
+    }).catch(() => {});
+}
+
+// refreshProfileFromServer: pulls the live profile (and therefore aiSummary)
+// from the dashboard backend so the panel never grades against a cached
+// summary. Uses background's reloadProfile which writes to chrome.storage +
+// state.config.authProfile. Updates local cfg + repaints both summary +
+// preferred-roles sections.
+async function refreshProfileFromServer() {
+    if (!cfg.authEmail) return;
+    summaryRefreshing = true;
+    renderSummarySection();
+    const r = await send('jrd-reload-profile').catch((e) => ({ ok: false, error: 'NETWORK', message: e?.message }));
+    summaryRefreshing = false;
+    if (!r || !r.ok) {
+        console.warn('[FF-JRD] reload-profile failed:', r?.error, r?.message);
+        renderSummarySection();
+        return;
+    }
+    cfg.authProfile = r.profile || cfg.authProfile;
+    try { await chrome.storage.local.set({ authProfile: cfg.authProfile }); } catch {}
+    renderClientBar();
+    renderPreferredRoles();
+    renderSummarySection();
+}
+
+// Quick-bump amount when operator clicks "+10 cap" on the banner. Big enough
+// to clear a typical day's pipeline; small enough that an accidental click
+// can't blow past the operator's intent.
+const CAP_BUMP_DEFAULT = 10;
+
+function renderCapHitBanner() {
+    let bar = $('cap-hit-banner');
+    if (!capHit) {
+        if (bar) bar.remove();
+        return;
+    }
+    const total = capInfoCache?.targetJobCount ?? '?';
+    const current = capInfoCache?.currentOps ?? '?';
+    const text = `Client cap reached — ${current} of ${total} jobs already pushed.`;
+    const bumpTo = Number.isFinite(Number(total)) ? Number(total) + CAP_BUMP_DEFAULT : CAP_BUMP_DEFAULT;
+    if (!bar) {
+        bar = document.createElement('div');
+        bar.id = 'cap-hit-banner';
+        bar.className = 'cap-hit-banner';
+        const main = els.mainView;
+        if (main) main.insertBefore(bar, main.firstChild?.nextSibling || null);
+    }
+    bar.innerHTML = `
+        <span class="cap-hit-icon">⛔</span>
+        <span class="cap-hit-text">${escapeHtml(text)}</span>
+        <button type="button" class="cap-bump-btn" id="cap-bump-btn" title="Raise cap to ${bumpTo} and resume">
+            +${CAP_BUMP_DEFAULT} cap → ${bumpTo}
+        </button>
+        <div class="cap-bump-msg" id="cap-bump-msg" hidden></div>`;
+    const btn = bar.querySelector('#cap-bump-btn');
+    if (btn) btn.addEventListener('click', () => bumpCap(bumpTo));
+}
+
+// bumpCap: hits dashboard /update-target-jobs to raise the client's cap by
+// CAP_BUMP_DEFAULT. On success, clears local capHit + refreshes capInfo so
+// Start re-enables and the banner disappears. Fires inline error message
+// otherwise (network down, cap too high, etc).
+async function bumpCap(newCap) {
+    if (!cfg.authEmail) return;
+    const btn = $('cap-bump-btn');
+    const msg = $('cap-bump-msg');
+    if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+    if (msg) { msg.hidden = true; msg.textContent = ''; }
+    let res;
+    try {
+        res = await fetch(`${API_BASE_URL.replace(/\/+$/, '')}/update-target-jobs`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ email: cfg.authEmail, targetJobCount: newCap }),
+        });
+    } catch (e) {
+        if (msg) { msg.hidden = false; msg.textContent = `Network error: ${e.message}`; }
+        if (btn) { btn.disabled = false; btn.textContent = `+${CAP_BUMP_DEFAULT} cap → ${newCap}`; }
+        return;
+    }
+    let body = null; try { body = await res.json(); } catch {}
+    if (!res.ok || !body?.success) {
+        const m = body?.message || `HTTP ${res.status}`;
+        if (msg) { msg.hidden = false; msg.textContent = `Failed: ${m}`; }
+        if (btn) { btn.disabled = false; btn.textContent = `+${CAP_BUMP_DEFAULT} cap → ${newCap}`; }
+        return;
+    }
+    // Server saved. Clear the gate locally + re-sync from /push-history so
+    // the daily card + tile reflect the new remaining count immediately.
+    capHit = false;
+    capInfoCache = null;
+    renderCapHitBanner();
+    applyState();
+    setMessage(`Cap raised to ${newCap}. Pipeline resumed.`, 'ok');
+    pushTickerLine(`✓ cap raised to ${newCap}`, 'push');
+    // Tell SW to re-pull push-history so its capInfo + capHit flag clear.
+    send('jrd-refresh-cap').catch(() => {});
+    loadDailyStats().catch(() => {});
 }
 
 // loadDailyStats: GET /push-history?email=X&days=14, paint today's count,
@@ -391,6 +516,20 @@ function renderDailyStats(history) {
     const cap = Number.isFinite(Number(history?.capInfo?.targetJobCount)) ? history.capInfo.targetJobCount : null;
     const remaining = Number.isFinite(Number(history?.capInfo?.remaining)) ? history.capInfo.remaining : null;
     const totalOps = history?.totals?.ops || 0;
+
+    // Server is source of truth for the cap. If remaining hit 0 mirror that
+    // into local capHit + repaint banner — defensive in case the SW missed
+    // the TARGET_REACHED reply (eviction race). Conversely, if dashboard
+    // raised the cap we clear the local flag so Start re-enables.
+    if (cap != null && Number.isFinite(remaining)) {
+        capInfoCache = { targetJobCount: cap, currentOps: totalOps, remaining };
+        const shouldHit = remaining <= 0;
+        if (shouldHit !== capHit) {
+            capHit = shouldHit;
+            renderCapHitBanner();
+            applyState();
+        }
+    }
 
     // Mirror cap into the per-client stats tile so the operator never has
     // to look in two places. Hide the tile when no cap is set.
@@ -502,11 +641,19 @@ function renderSummarySection() {
     const summary = p.aiSummary || '';
     const meta = p.aiSummaryMeta || {};
     const metaEl = $('summary-meta');
+    if (summaryRefreshing && !summary) {
+        els.summaryStatus.textContent = 'Refreshing…';
+        els.summaryStatus.className = 'summary-status refreshing';
+        els.summaryBody.className = 'summary-body empty-msg';
+        els.summaryBody.textContent = 'Fetching latest summary from dashboard…';
+        if (metaEl) { metaEl.hidden = true; metaEl.innerHTML = ''; }
+        return;
+    }
     if (summary) {
         const built = meta.builtAt ? new Date(meta.builtAt).toLocaleString() : 'unknown';
         const words = meta.wordCount || summary.split(/\s+/).filter(Boolean).length;
-        els.summaryStatus.textContent = 'Saved';
-        els.summaryStatus.className = 'summary-status fresh';
+        els.summaryStatus.textContent = summaryRefreshing ? 'Refreshing…' : 'Saved';
+        els.summaryStatus.className = summaryRefreshing ? 'summary-status refreshing' : 'summary-status fresh';
         els.summaryBody.className = 'summary-body loaded';
         els.summaryBody.textContent = summary;
         if (metaEl) {
@@ -544,7 +691,12 @@ function applyState() {
     els.linkedinSkippedCount.textContent = String(linkedinSkippedCount);
     els.activeState.textContent = captureActive ? 'YES' : 'no';
     els.statusDot.classList.toggle('active', !!captureActive);
-    els.start.disabled = !!captureActive || isProcessing;
+    els.start.disabled = !!captureActive || isProcessing || capHit;
+    if (capHit) {
+        els.start.title = 'Client cap reached — raise the target on the dashboard before scraping more.';
+    } else {
+        els.start.title = '';
+    }
     // In auto-mode the Judge button becomes a "flush remaining" trigger;
     // it stays enabled whenever capture is active (no isJudged gate).
     if (cfg.autoMode !== false) {
@@ -580,6 +732,20 @@ function countSelectedPicks() {
 
 // ---- decision card rendering -------------------------------------------
 
+// Operator-facing labels for skipKind. Threshold = soft skip (a looser bar
+// would have picked it). Mismatch = hard reject (would never pick).
+const SKIP_KIND_LABELS = {
+    'threshold':           'below threshold',
+    'role-mismatch':       'role mismatch',
+    'seniority-mismatch':  'seniority mismatch',
+    'location-mismatch':   'location mismatch',
+    'auth-mismatch':       'work-auth mismatch',
+    'company-blocked':     'company blocked',
+};
+function skipKindLabel(kind) {
+    return SKIP_KIND_LABELS[kind] || kind;
+}
+
 function scoreClass(score) {
     if (!Number.isFinite(score) || score === 0) return 's-zero';
     if (score >= 70) return 's-high';
@@ -595,7 +761,11 @@ function renderCard(entry) {
     const outcomeClass = outcome ? `outcome-${outcome}` : '';
     const pushingClass = pushing ? 'pushing' : '';
     const flipClass = manualFlip ? 'manual-flip' : '';
-    card.className = `decision-card ${pickClass} ${outcomeClass} ${pushingClass} ${flipClass}`;
+    // Skip kind drives the left-border colour so operator can scan failures
+    // by category at a glance: gray=threshold, amber=ai-judged mismatch,
+    // red=hard-signal violation. Picks always render with the accent border.
+    const skipKindClass = decision.skipKind ? `skip-kind-${decision.skipKind}` : '';
+    card.className = `decision-card ${pickClass} ${outcomeClass} ${pushingClass} ${flipClass} ${skipKindClass}`;
     card.dataset.jobId = decision.id;
 
     const meta = [];
@@ -650,6 +820,8 @@ function renderCard(entry) {
             <span class="score-pill ${scoreClass(decision.score)}">${decision.score}</span>
         </div>
         ${meta.length ? `<div class="decision-meta">${meta.join('')}</div>` : ''}
+        ${decision.matchedRole ? `<div class="matched-role"><span class="matched-role-label">Maps to preferred role</span><span class="matched-role-val">${escapeHtml(decision.matchedRole)}</span></div>` : ''}
+        ${decision.skipKind ? `<div class="skip-kind-tag skip-kind-tag-${escapeHtml(decision.skipKind)}">${escapeHtml(skipKindLabel(decision.skipKind))}</div>` : ''}
         ${decision.reason ? `<div class="decision-reason">${escapeHtml(decision.reason)}</div>` : ''}
         ${actionsHtml || outcomeHtml ? `<div class="decision-actions">${actionsHtml}${outcomeHtml}</div>` : ''}
     `;
@@ -768,12 +940,14 @@ async function refreshState() {
         captureCount = s.capture?.count || 0;
         linkedinSkippedCount = s.capture?.linkedinSkipped || 0;
         captureActive = !!s.capture?.active;
+        capHit = !!s.auto?.capHit;
+        capInfoCache = s.auto?.capInfo || null;
         if (s.lastResult && Array.isArray(s.lastResult.decisions)) {
             decisionsMap.clear();
             for (const d of s.lastResult.decisions) {
                 if (!d.job) continue;
                 decisionsMap.set(d.id, {
-                    decision: { id: d.id, pick: d.pick, score: d.score, reason: d.reason },
+                    decision: { id: d.id, pick: d.pick, score: d.score, reason: d.reason, matchedRole: d.matchedRole || '', skipKind: d.skipKind || '' },
                     job: d.job,
                     outcome: d.outcome === 'skipped-by-threshold' || d.outcome === 'skipped' ? null : d.outcome,
                     detail: d.detail || '',
@@ -1061,6 +1235,18 @@ async function runPush() {
     await refreshState();
 }
 
+async function stopCapture() {
+    if (!captureActive) { setMessage('Capture is already stopped.', 'warn'); return; }
+    setMessage('Stopping capture — auto-pipeline will drain remaining jobs…');
+    const r = await send('jrd-stop-capture');
+    if (!r?.ok) { setMessage('Failed to stop capture.', 'error'); return; }
+    captureActive = false;
+    applyState();
+    setMessage(`Capture stopped. ${r.count || captureCount} job${(r.count || captureCount) === 1 ? '' : 's'} in buffer — pipeline finishing.`, 'ok');
+    setLive('Stopped', 'Auto-pipeline draining remaining picks…', 'success');
+    hideLive(2500);
+}
+
 async function resetCapture() {
     await send('jrd-clear-capture');
     captureCount = 0; linkedinSkippedCount = 0; captureActive = false; isJudged = false;
@@ -1139,6 +1325,21 @@ chrome.runtime.onMessage.addListener((msg) => {
                 pushTickerLine(`⚑ cap reached — capture auto-stopped`, 'batch');
                 setLive('Cap reached', `${msg.cap || CAPTURE_CAP} captures — auto-stopping new ingest. Pipeline still draining…`, 'success');
                 hideLive(4500);
+            }
+            if (msg.phase === 'cap-hit') {
+                // Server-side client cap (targetJobCount) reached. Hard halt:
+                // capture stops, no further pushes, banner stays until resolved.
+                captureActive = false;
+                capHit = true;
+                capInfoCache = msg.capInfo || capInfoCache;
+                applyState();
+                renderCapHitBanner();
+                setMessage(msg.message || 'Client target reached — pushes halted.', 'error');
+                pushTickerLine(`⊗ client cap reached — pipeline halted`, 'push');
+                setLive('Cap hit', msg.message || 'Client target reached.', 'error');
+                hideLive(0);
+                // Refresh the daily card so the tile reflects "0 remaining".
+                scheduleDailyRefresh(50);
             }
             break;
         case 'ai-batch-start': handleAiBatchStart(msg); break;
@@ -1244,6 +1445,8 @@ if (els.codeBack) els.codeBack.addEventListener('click', () => {
     showLogin();
 });
 els.logout.addEventListener('click', doLogout);
+const shortcutHintBtn = $('shortcut-hint');
+if (shortcutHintBtn) shortcutHintBtn.addEventListener('click', () => toggleShortcutHelp());
 els.saveConfig.addEventListener('click', saveConfig);
 els.start.addEventListener('click', startCapture);
 els.judge.addEventListener('click', runJudge);
@@ -1272,6 +1475,92 @@ window.addEventListener('beforeunload', (e) => {
         return e.returnValue;
     }
 });
+
+// ---- keyboard shortcuts -------------------------------------------------
+//
+// S=start · D=stop · K=judge · P=push · R=reset · ?=help · Esc=close help.
+// Skip when focus lives in a form control (don't hijack typing) and skip
+// when the panel is on the login or code view (creds/codes need every key).
+const SHORTCUTS = [
+    { key: 's', label: 'Start capture',  run: () => safeClick(els.start) },
+    { key: 'd', label: 'Stop capture',   run: () => stopCapture() },
+    { key: 'k', label: 'Judge / flush',  run: () => safeClick(els.judge) },
+    { key: 'p', label: 'Push picks',     run: () => safeClick(els.push) },
+    { key: 'r', label: 'Reset session',  run: () => safeClick(els.reset) },
+    { key: '?', label: 'Toggle help',    run: () => toggleShortcutHelp() },
+];
+
+function safeClick(btn) {
+    if (!btn || btn.hidden || btn.disabled) {
+        setMessage(`Shortcut ignored — ${btn?.id || 'button'} not actionable right now.`, 'warn');
+        return;
+    }
+    btn.click();
+}
+
+function isTypingTarget(t) {
+    if (!t) return false;
+    const tag = (t.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select') return true;
+    if (t.isContentEditable) return true;
+    return false;
+}
+
+document.addEventListener('keydown', (e) => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (isTypingTarget(e.target)) return;
+    // Only main view honors shortcuts — login/code views need every keystroke.
+    if (els.mainView?.hidden) {
+        if (e.key === 'Escape' && !els.shortcutHelp?.hidden) toggleShortcutHelp(false);
+        return;
+    }
+    if (e.key === 'Escape') {
+        if (els.shortcutHelp && !els.shortcutHelp.hidden) {
+            toggleShortcutHelp(false);
+            e.preventDefault();
+        }
+        return;
+    }
+    const k = e.key.toLowerCase();
+    const sc = SHORTCUTS.find((s) => s.key === k);
+    if (!sc) return;
+    e.preventDefault();
+    sc.run();
+});
+
+function toggleShortcutHelp(force) {
+    let panel = els.shortcutHelp || $('shortcut-help');
+    if (!panel) {
+        panel = document.createElement('div');
+        panel.id = 'shortcut-help';
+        panel.className = 'shortcut-help';
+        panel.innerHTML = `
+            <div class="shortcut-help-card">
+                <div class="shortcut-help-head">
+                    <span class="shortcut-help-title">Keyboard shortcuts</span>
+                    <button type="button" class="shortcut-help-close" aria-label="Close">×</button>
+                </div>
+                <div class="shortcut-help-body">
+                    ${SHORTCUTS.map((s) => `
+                        <div class="shortcut-row">
+                            <kbd>${escapeHtml(s.key.toUpperCase())}</kbd>
+                            <span>${escapeHtml(s.label)}</span>
+                        </div>
+                    `).join('')}
+                    <div class="shortcut-row">
+                        <kbd>Esc</kbd><span>Close this overlay</span>
+                    </div>
+                </div>
+                <div class="shortcut-help-foot">Shortcuts ignored when typing in inputs.</div>
+            </div>`;
+        document.body.appendChild(panel);
+        els.shortcutHelp = panel;
+        panel.querySelector('.shortcut-help-close').addEventListener('click', () => toggleShortcutHelp(false));
+        panel.addEventListener('click', (e) => { if (e.target === panel) toggleShortcutHelp(false); });
+    }
+    const next = typeof force === 'boolean' ? force : panel.hidden;
+    panel.hidden = !next;
+}
 
 // Boot
 refreshState();
