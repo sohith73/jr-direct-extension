@@ -18,7 +18,7 @@ const DEFAULTS = {
     // automatically as the operator scrolls. Triggers a batch every
     // `autoBatchSize` newly captured jobs. No manual Push needed.
     autoMode: true,
-    autoBatchSize: 8,
+    autoBatchSize: 5,
     autoPushConcurrency: 3,
     // OpenAI direct-call config — must be in DEFAULTS so loadConfig() pulls
     // it from chrome.storage.local after SW eviction. Without this in the
@@ -1011,56 +1011,121 @@ const SYSTEM_PROMPT = `You are a hiring-fit grader for a job-search assistant.
 For each job, decide whether it matches the candidate's profile.
 
 The user prompt contains a "## Candidate hard signals" block with the
-authoritative preferredRoles, experienceLevel, and preferredLocations
-pulled DIRECTLY from the client's onboarding profile. This is the
-ground truth — the candidate-brief / aiSummary may paraphrase, but if
-they conflict, the hard-signals block wins.
+authoritative preferredRoles, excludedRoles, experienceLevel, and
+preferredLocations pulled DIRECTLY from the client's onboarding profile.
+This is the ground truth — the candidate-brief / aiSummary may paraphrase,
+but if they conflict, the hard-signals block wins.
+
+excludedRoles is a HARD VETO list. The candidate explicitly opted out
+of these role families (e.g. "Technician", "QA", "Manager"). If the job
+title or its role family matches ANY excludedRole — even loosely — you
+MUST set pick=false and skipKind="role-mismatch", and the reason MUST
+quote the matched excludedRole verbatim ("Skip — title 'QA Technician'
+matches excluded role 'Technician'; candidate opted out of those").
+This rule overrides every other signal, including high JR match scores.
+
+Each job in "Jobs to judge" includes a "jd" field — the FULL composed
+job description (responsibilities + must-haves + nice-to-haves + skills
++ benefits, up to 4500 chars). When jdSource="full" you MUST read the
+JD for hard disqualifiers buried in the body — clearance required,
+on-site/in-office mandates, citizenship-only clauses, 10+ YOE caps,
+travel %, language requirements. These almost never appear in the
+title or in the JR-provided whyMatch preview. When jdSource="preview"
+the JD wasn't resolved (scraper unreachable); fall back to title +
+whyMatch + tags for the decision and lower confidence on close calls.
 
 Return STRICT JSON only — no prose, no markdown:
-{"decisions":[{"id":"<jobId>","pick":<true|false>,"score":<0-100>,"reason":"<200-300 chars>","matchedRole":"<which preferredRole this maps to, or '' for skip>","skipKind":"<see below, '' for picks>"}]}
+{"decisions":[{"id":"<jobId>","pick":<true|false>,"score":<0-100>,"reason":"<one short sentence, 90-160 chars>","matchedRole":"<verbatim preferredRole this maps to, or '' for skip>","skipKind":"<see below, '' for picks>"}]}
 
 skipKind enum (REQUIRED for every skip — empty string for picks):
 - "threshold"      → score >= 40 but < operator threshold (would pick on a looser bar)
-- "role-mismatch"  → job title's role family does not map to any preferredRole
-- "seniority-mismatch" → role family matches but seniority is 2+ levels off
+- "role-mismatch"  → job title's discipline qualifier does NOT match any preferredRole's qualifier
+- "seniority-mismatch" → discipline matches but seniority is 2+ levels off
 - "location-mismatch"  → outside preferredLocations + workModel forbids it
 - "auth-mismatch"  → requires citizenship/clearance candidate doesn't have
 - "company-blocked" → company name in excludedCompanies
 Pick the SINGLE biggest reason; do not stack. Used by the UI to color-code
 the skip border so the operator can scan failures at a glance.
 
+ROLE MATCHING (THE MOST IMPORTANT RULE — read carefully):
+
+The candidate's preferredRoles list is the WHOLE universe of acceptable
+disciplines. Do NOT invent role groupings. Do NOT widen the family.
+
+Step 1 — Extract the discipline QUALIFIER from each preferredRole.
+  "Data Analyst"                  → qualifier "Data"
+  "Data Engineer"                 → qualifier "Data"
+  "Financial Analyst"             → qualifier "Financial" (also "Finance")
+  "Business Analyst"              → qualifier "Business"
+  "Business Intelligence Engineer" → qualifier "Business Intelligence" / "BI"
+  "Backend Engineer"              → qualifier "Backend"
+  "Product Manager"               → qualifier "Product"
+The bare role noun ("Analyst", "Engineer", "Manager", "Specialist",
+"Developer") is NEVER a qualifier on its own.
+
+Step 2 — Look at the JOB TITLE. Pick ONLY when the title contains a
+qualifier that lines up with one of the candidate's qualifiers (case-
+insensitive, allow obvious abbreviations: BI ↔ Business Intelligence,
+ML ↔ Machine Learning, FE ↔ Frontend, BE ↔ Backend).
+
+Step 3 — When in doubt, SKIP with skipKind:"role-mismatch". Operator
+prefers fewer high-quality picks over more loose ones.
+
+Examples for preferredRoles = [Data Analyst, Data Engineer, Financial
+Analyst, Business Analyst, Business Intelligence Engineer]:
+  "Data Analyst, Senior"          → PICK · matchedRole "Data Analyst"
+  "Senior BI Analyst"             → PICK · matchedRole "Business Intelligence Engineer" (BI qualifier matches)
+  "Reporting Analyst (BI)"        → PICK if JD body confirms BI work · matchedRole "Business Intelligence Engineer"
+  "Financial Planning Analyst"    → PICK · matchedRole "Financial Analyst"
+  "Analyst I"                     → SKIP role-mismatch — title carries no qualifier, generic
+  "Category Sourcing Analyst"     → SKIP role-mismatch — Sourcing qualifier not in candidate list
+  "Inventory Control Analyst"     → SKIP role-mismatch — Inventory Control qualifier not in candidate list
+  "Inventory Control Specialist"  → SKIP role-mismatch — same as above
+  "GenAI Python Systems Engineer" → SKIP role-mismatch — Systems Engineering ≠ Data Engineering
+  "Software Engineer (Frontend)"  → SKIP role-mismatch — Frontend qualifier absent from candidate list
+  "Quantitative Analyst"          → SKIP role-mismatch — Quant ≠ Financial Analyst (different discipline)
+
 Scoring rules:
-- score 0-100 weighing: role family (40%), seniority alignment (25%),
-  location/work-model fit (15%), skills/experience signals (15%),
-  salary band (5%).
-- Pick when score >= the operator threshold passed in the user prompt
-  AND the job title maps cleanly to one of the candidate's preferredRoles
-  (same family, see groupings below). If no preferredRole maps, force pick=false.
-- Skip when seniority is 4+ levels off (intern asked → VP role; senior → entry intern).
-- Treat Software Engineer / Backend / Frontend / Full-Stack / Platform / SRE
-  / DevOps / Data / ML / AI / Mobile / Security / QA as ONE engineering family.
-- Treat Product Manager / Product Owner / Associate PM / Sr PM / Director PM
-  as the same family at different seniority.
+- score 0-100 weighing: role qualifier match (50%), seniority (20%),
+  location/work-model (15%), skills/JD signals (10%), salary (5%).
+- BEFORE any pick logic: excludedRoles veto. If title contains an
+  excludedRole token (case-insensitive substring), force pick=false
+  with skipKind="role-mismatch" — no exceptions.
+- BEFORE any pick logic: if no preferredRole qualifier matches the title
+  (Step 2 above), force pick=false. Do not invent partial matches.
+- Pick only when (a) qualifier matches AND (b) score >= operator threshold
+  passed in the user prompt AND (c) seniority within 2 levels of
+  candidate's experienceLevel.
+- Skip when seniority is 3+ levels off (intern asked → VP; senior → entry).
+- Do NOT lump "Data" with "Software Engineer / Backend / SRE / DevOps /
+  Mobile / Security / QA" unless those exact qualifiers appear in
+  preferredRoles. Each discipline is its own family.
 
-REASON QUALITY — every reason MUST:
-- Be 2-3 sentences, 200-300 chars total.
-- Cite the EXACT preferredRole string the job maps to (or fails to map to).
-  Use the wording from the hard-signals block, e.g. "matches preferred role
-  'Backend Engineer'" — not generic phrasing.
-- Name candidate experienceLevel vs job seniority explicitly.
-- Name candidate preferredLocations vs job location/workModel explicitly.
-- For SKIPS: lead with the disqualifier and which preferredRole it failed
-  ("Skip — Sr Director PM is 3 levels above candidate's 'Associate PM' target;
-  also outside preferred locations [SF/NYC]").
-- For PICKS: lead with the matched preferredRole and seniority alignment
-  ("Strong fit for preferred role 'Backend Engineer' at mid-level — matches
-  candidate's 3-5 YOE band; remote-US covers their 'Remote' preference").
+REASON QUALITY — every reason MUST be ONE short sentence, 90-160 chars,
+plain English, no fluff. Pattern:
 
-The "matchedRole" field MUST be populated for every pick with the verbatim
-preferredRole from the hard-signals block. Empty string for skips.
+  PICK:  "Pick — '<job title>' matches '<preferredRole>' (<qualifier>); <seniority+location note>."
+         e.g. "Pick — 'Senior Data Analyst' matches 'Data Analyst' (Data); senior aligns, remote-US covers Remote."
 
-NEVER write generic reasons like "good fit" or "not a match" — always cite
-a concrete preferredRole + seniority + location signal.`;
+  SKIP role-mismatch:
+         "Skip — '<job title>' has no qualifier from preferredRoles [<short list>]; closest gap is <gap>."
+         e.g. "Skip — 'Inventory Control Analyst' has no qualifier from [Data, Financial, Business, BI]; Inventory Control isn't a match."
+
+  SKIP seniority-mismatch:
+         "Skip — '<job title>' is <gap> above/below candidate's <experienceLevel> on '<preferredRole>'."
+
+  SKIP location-mismatch:
+         "Skip — '<job title>' is <city/onsite>, outside preferredLocations [<list>]."
+
+  SKIP auth-mismatch:
+         "Skip — JD requires <clearance/citizenship>; candidate is <visa status>."
+
+The "matchedRole" field MUST be the VERBATIM preferredRole string for
+picks. Empty string for skips. NEVER paraphrase or rename. Use the
+strings exactly as they appear in the hard-signals block.
+
+NEVER write generic reasons like "good fit", "not a match", "see JD",
+"strong alignment". Always be concrete and tight.`;
 
 function buildUserPrompt({ profile, jobs, threshold, aiSummary }) {
     // Hard-signals block ALWAYS goes in, even when an aiSummary exists. The
@@ -1072,10 +1137,45 @@ function buildUserPrompt({ profile, jobs, threshold, aiSummary }) {
         if (typeof v === 'string') return v.split(/\s*[/|,]\s*|\s{2,}/).map((s) => s.trim()).filter(Boolean);
         return [];
     };
-    const preferredRoles = fmtList(profile?.preferredRoles);
+    // splitRoles — clients sometimes type negative clauses INTO the
+    // preferredRoles field ("Do not add Technician roles", "no QA").
+    // Partition each entry so the model gets explicit preferred + excluded
+    // lists and can map the latter to skipKind:'role-mismatch'. Mirrors
+    // BuildAiSummary.js → splitPreferredRoles in the dashboard backend.
+    const NEG_LEAD = /^\s*(?:do\s*not|don'?t|no(?:t|pe)?|avoid|exclude|skip|never|reject|hate|dislike|remove|drop|filter\s*out)\s*(?:add|include|consider|show|pick|push|send|want)?\b\s*/i;
+    const ROLE_NOUNS = /\b(?:roles?|positions?|jobs?|titles?)\b/gi;
+    function splitRoles(rawList) {
+        const preferred = [];
+        const excluded = [];
+        for (const piece of rawList) {
+            const s = String(piece || '').trim();
+            if (!s) continue;
+            if (s.includes(',') && NEG_LEAD.test(s.split(',').slice(-1)[0].trim())) {
+                for (const sub of s.split(/\s*,\s*/)) {
+                    const t = sub.trim();
+                    if (!t) continue;
+                    if (NEG_LEAD.test(t)) {
+                        const cleaned = t.replace(NEG_LEAD, '').replace(ROLE_NOUNS, '').trim();
+                        if (cleaned) excluded.push(cleaned);
+                    } else preferred.push(t);
+                }
+                continue;
+            }
+            if (NEG_LEAD.test(s)) {
+                const cleaned = s.replace(NEG_LEAD, '').replace(ROLE_NOUNS, '').trim();
+                if (cleaned) excluded.push(cleaned);
+            } else {
+                preferred.push(s);
+            }
+        }
+        return { preferred, excluded };
+    }
+    const rolesRaw = fmtList(profile?.preferredRoles);
+    const { preferred: preferredRoles, excluded: excludedRoles } = splitRoles(rolesRaw);
     const preferredLocations = fmtList(profile?.preferredLocations);
     const hardSignals = {
         preferredRoles: preferredRoles.length ? preferredRoles : '(not specified — fall back to summary)',
+        excludedRoles: excludedRoles.length ? excludedRoles : [],
         experienceLevel: profile?.experienceLevel || '(not specified)',
         preferredLocations: preferredLocations.length ? preferredLocations : '(not specified)',
         workAuth: profile?.usWorkEligibility || profile?.visaStatus || '(not specified)',
@@ -1087,21 +1187,35 @@ function buildUserPrompt({ profile, jobs, threshold, aiSummary }) {
         : `## Candidate raw profile (no AI summary built yet):\n${JSON.stringify({
               targetCompanies: profile?.targetCompanies || '',
           }, null, 2)}\n`;
-    const slim = jobs.map((j) => ({
-        id: j.jobId,
-        title: j.title,
-        company: j.company,
-        industries: j.industries,
-        location: j.location,
-        workModel: j.workModel,
-        seniority: j.seniority,
-        experience: j.experienceYears,
-        salary: j.salary,
-        publishedAt: j.publishedAt,
-        jrMatch: `${j.matchPercent || 0}% — ${j.fitFlag || ''}`,
-        whyMatch: j.matchSummary,
-        tags: j.tags,
-    }));
+    // Send the FULL composed JD when available so the model can flag real
+    // disqualifiers (clearance required, on-site only, citizenship clause,
+    // 10+ YOE) that never appear in the 200-char matchSummary preview.
+    // Trim to MAX_JD_CHARS to keep batch token cost bounded — gpt-4o-mini
+    // priced at ~$0.15/1M input, so 5 jobs × 4500 chars ≈ $0.0008/batch.
+    const MAX_JD_CHARS = 4500;
+    const slim = jobs.map((j) => {
+        const fullJd = j.description && j.description.length > (j.matchSummary || '').length
+            ? j.description
+            : (j.matchSummary || '');
+        const jd = String(fullJd || '').slice(0, MAX_JD_CHARS);
+        return {
+            id: j.jobId,
+            title: j.title,
+            company: j.company,
+            industries: j.industries,
+            location: j.location,
+            workModel: j.workModel,
+            seniority: j.seniority,
+            experience: j.experienceYears,
+            salary: j.salary,
+            publishedAt: j.publishedAt,
+            jrMatch: `${j.matchPercent || 0}% — ${j.fitFlag || ''}`,
+            whyMatch: j.matchSummary,
+            tags: j.tags,
+            jdSource: j.description && j.description.length > 200 ? 'full' : 'preview',
+            jd,
+        };
+    });
     return `Threshold: ${threshold}
 
 ${hardSignalsBlock}
@@ -1110,13 +1224,177 @@ ${intentBlock}
 ${JSON.stringify(slim, null, 2)}`;
 }
 
+// resolvePreJudge: parallel-resolve full JD for every job in the batch
+// BEFORE handing off to OpenAI. Mutates each job in place so the slim
+// prompt builder picks up the full description. Falls back to matchSummary
+// when scraper is unreachable for a job — never blocks the whole batch
+// on a single failure. Resolutions are cached, so a re-judge is cheap.
+async function resolvePreJudge(jobs, { concurrency = 5 } = {}) {
+    if (!Array.isArray(jobs) || jobs.length === 0) return { resolved: 0, fallback: 0 };
+    notifyPopup('judge-prep', { stage: 'resolving', total: jobs.length });
+    let resolved = 0;
+    let fallback = 0;
+    let cursor = 0;
+    async function worker() {
+        while (cursor < jobs.length) {
+            const idx = cursor++;
+            const j = jobs[idx];
+            // Already has a full JD (e.g. cached from earlier scroll) — skip.
+            if (j.description && j.description.length > 600) {
+                resolved += 1;
+                notifyPopup('judge-prep', { stage: 'resolved', done: resolved + fallback, total: jobs.length });
+                continue;
+            }
+            try {
+                const r = await resolveJobDetail(j.jobId);
+                if (r.ok && r.description && r.description.length > 200) {
+                    j.description = r.description;
+                    // Don't overwrite applyUrl here — auto-pipeline does it
+                    // post-judge to keep the resolve-vs-judge boundary clean.
+                    resolved += 1;
+                } else {
+                    fallback += 1;
+                }
+            } catch (e) {
+                fallback += 1;
+                console.warn('[FF-JRD] resolvePreJudge failed for', j.jobId, e?.message);
+            }
+            notifyPopup('judge-prep', { stage: 'resolved', done: resolved + fallback, total: jobs.length });
+        }
+    }
+    await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker));
+    console.log('[FF-JRD] resolvePreJudge done — full', resolved, '/ fallback', fallback);
+    return { resolved, fallback };
+}
+
 async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
     if (!state.config.openaiKey) return { ok: false, error: 'NO_OPENAI_KEY' };
     if (!jobs.length) return { ok: true, decisions: [] };
 
-    // Batch in chunks of 8 — small enough that a 4o-mini call latency stays
-    // < 5s and JSON output reliably validates.
-    const BATCH = 8;
+    // Deterministic excluded-role veto. The model is instructed to honor
+    // excludedRoles but we don't trust it 100% — this post-filter flips any
+    // pick to a skipKind:'role-mismatch' when the job title contains an
+    // excluded token. Mirrors splitRoles() inside buildUserPrompt; kept
+    // inline so we don't have to thread the closure helper out.
+    const NEG = /^\s*(?:do\s*not|don'?t|no(?:t|pe)?|avoid|exclude|skip|never|reject|hate|dislike|remove|drop|filter\s*out)\s*(?:add|include|consider|show|pick|push|send|want)?\b\s*/i;
+    const NOUNS = /\b(?:roles?|positions?|jobs?|titles?)\b/gi;
+    const rolesRaw = Array.isArray(profile?.preferredRoles)
+        ? profile.preferredRoles
+        : typeof profile?.preferredRoles === 'string'
+            ? profile.preferredRoles.split(/\s*[/|,]\s*|\s{2,}/)
+            : [];
+    const excludedRoleTokens = [];
+    for (const r of rolesRaw) {
+        const s = String(r || '').trim();
+        if (!s) continue;
+        const parts = s.includes(',') && NEG.test(s.split(',').slice(-1)[0].trim())
+            ? s.split(/\s*,\s*/)
+            : [s];
+        for (const p of parts) {
+            const t = p.trim();
+            if (!t || !NEG.test(t)) continue;
+            const cleaned = t.replace(NEG, '').replace(NOUNS, '').trim().toLowerCase();
+            if (cleaned) excludedRoleTokens.push(cleaned);
+        }
+    }
+    function vetoExcluded(decision, job) {
+        if (!decision.pick || excludedRoleTokens.length === 0) return decision;
+        const title = String(job?.title || '').toLowerCase();
+        const hit = excludedRoleTokens.find((tok) => tok && title.includes(tok));
+        if (!hit) return decision;
+        return {
+            ...decision,
+            pick: false,
+            skipKind: 'role-mismatch',
+            matchedRole: '',
+            reason: `Skip — title "${job?.title || ''}" matches excluded role "${hit}"; candidate explicitly opted out of these. (Auto-vetoed; AI scored ${decision.score}.)`,
+        };
+    }
+
+    // Qualifier-match veto. The AI is told to require a discipline qualifier
+    // match between job title and preferredRoles, but historically it has
+    // picked broad-family titles ("Inventory Control Analyst" vs preferred
+    // "Data Analyst"). Build a qualifier set from the candidate's preferred
+    // roles and force-skip any pick whose title doesn't contain at least one
+    // qualifier (case-insensitive substring). Conservative: false negatives
+    // are cheaper than wrong jobs landing in the client's tracker.
+    const ROLE_NOUN_STRIP = /\b(?:engineer|developer|analyst|manager|specialist|consultant|associate|architect|administrator|lead|director|vp|officer|technician|scientist|coordinator|executive|advisor|representative|operator|owner|head|chief|principal|senior|sr|jr|junior|staff|intern)\b/gi;
+    // Common abbreviations operators expect us to honor.
+    const ABBREV_MAP = {
+        'business intelligence': ['bi'],
+        'machine learning': ['ml'],
+        'artificial intelligence': ['ai'],
+        'frontend': ['fe', 'front end', 'front-end'],
+        'backend': ['be', 'back end', 'back-end'],
+        'quality assurance': ['qa'],
+        'site reliability': ['sre'],
+        'devops': ['dev ops', 'dev-ops'],
+        'product manager': ['pm'],
+        'project manager': ['pm'],
+    };
+    function expandQualifier(q) {
+        const lower = q.toLowerCase().trim();
+        const out = new Set();
+        if (lower) out.add(lower);
+        if (ABBREV_MAP[lower]) ABBREV_MAP[lower].forEach((a) => out.add(a));
+        // Reverse: if the qualifier itself is an abbrev, also accept the long form.
+        for (const [long, abbrevs] of Object.entries(ABBREV_MAP)) {
+            if (abbrevs.includes(lower)) out.add(long);
+        }
+        return [...out];
+    }
+    // Build qualifier set from the POSITIVE preferredRoles only (skip the
+    // negative entries we already partition into excludedRoleTokens above).
+    const positiveRoles = [];
+    for (const r of rolesRaw) {
+        const s = String(r || '').trim();
+        if (!s) continue;
+        if (NEG.test(s)) continue;
+        if (s.includes(',') && NEG.test(s.split(',').slice(-1)[0].trim())) {
+            for (const sub of s.split(/\s*,\s*/)) {
+                const t = sub.trim();
+                if (t && !NEG.test(t)) positiveRoles.push(t);
+            }
+        } else {
+            positiveRoles.push(s);
+        }
+    }
+    const qualifierTokens = new Set();
+    for (const role of positiveRoles) {
+        // "Data Analyst" → "Data" ; "Business Intelligence Engineer" → "Business Intelligence"
+        const stripped = role
+            .replace(ROLE_NOUN_STRIP, '')
+            .replace(/[()/+,]/g, ' ')
+            .replace(/\s{2,}/g, ' ')
+            .trim();
+        if (!stripped) continue;
+        for (const v of expandQualifier(stripped)) qualifierTokens.add(v);
+        // Single-word fallback: also accept the strongest single token
+        // (e.g. "Web Analyst" → also accept "Web").
+        const tokens = stripped.split(/\s+/).filter((t) => t.length >= 2);
+        for (const tok of tokens) for (const v of expandQualifier(tok)) qualifierTokens.add(v);
+    }
+    function vetoQualifierMiss(decision, job) {
+        if (!decision.pick) return decision;
+        if (qualifierTokens.size === 0) return decision; // no positive roles → don't veto
+        const title = String(job?.title || '').toLowerCase();
+        for (const tok of qualifierTokens) {
+            if (tok && title.includes(tok)) return decision; // match found
+        }
+        const sample = positiveRoles.slice(0, 4).join(', ') + (positiveRoles.length > 4 ? '…' : '');
+        return {
+            ...decision,
+            pick: false,
+            skipKind: 'role-mismatch',
+            matchedRole: '',
+            reason: `Skip — "${job?.title || ''}" carries no qualifier from preferred roles [${sample}]; not closely related. (Auto-vetoed; AI scored ${decision.score}.)`,
+        };
+    }
+
+    // Batch in chunks of 5 — picks now judge against the FULL JD (composed
+    // by resolvePreJudge), so each batch is ~4× the input token weight of
+    // the old preview-only path. 5 keeps latency under 6s on gpt-4o-mini.
+    const BATCH = 5;
     const decisions = [];
     const jobsById = new Map(jobs.map((j) => [j.jobId, j]));
     const totalBatches = Math.ceil(jobs.length / BATCH);
@@ -1170,7 +1448,7 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
         ]);
         for (const d of parsed.decisions) {
             const skipKindRaw = typeof d.skipKind === 'string' ? d.skipKind.trim() : '';
-            const norm = {
+            let norm = {
                 id: d.id,
                 pick: d.pick === true,
                 score: Number.isInteger(d.score) ? d.score : 0,
@@ -1183,10 +1461,17 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
                     ? ''
                     : (VALID_SKIP_KINDS.has(skipKindRaw) ? skipKindRaw : 'threshold'),
             };
+            const job = jobsById.get(d.id);
+            // Deterministic vetoes (run in this order so excluded wins):
+            //   1. excludedRoles veto — explicit opt-out by the client.
+            //   2. qualifier-miss veto — title doesn't contain any preferred
+            //      discipline qualifier (Data, Business Intelligence, etc.).
+            // Both are no-ops when their token sets are empty.
+            norm = vetoExcluded(norm, job);
+            norm = vetoQualifierMiss(norm, job);
             decisions.push(norm);
             // Stream each judged job into the side panel so the operator
             // sees reasoning in real time, not just at the end.
-            const job = jobsById.get(d.id);
             if (job) {
                 notifyPopup('decision', { decision: norm, job });
             }
@@ -1209,6 +1494,11 @@ async function judgeOnly() {
     if (!profileRes.ok) return { ok: false, error: 'PROFILE_LOAD', message: profileRes.error };
     const profile = profileRes.profile;
     const aiSummary = typeof profile?.aiSummary === 'string' ? profile.aiSummary : '';
+
+    // Pre-judge: resolve full JD for every captured job so OpenAI scores
+    // against real disqualifiers, not the 200-char matchSummary preview.
+    notifyPopup('phase', { phase: 'resolving-jds', total: jobs.length });
+    await resolvePreJudge(jobs);
 
     notifyPopup('phase', { phase: 'judging', total: jobs.length, usingSummary: !!aiSummary });
     const judge = await aiJudge({
@@ -1358,6 +1648,11 @@ async function runAutoBatch(batch) {
         console.log('[FF-JRD] auto: profile loaded; aiSummary=' + (ctx.aiSummary ? ctx.aiSummary.length + ' chars' : 'none'));
         // Mark before judging so concurrent ingest doesn't re-queue.
         for (const j of batch) state.auto.processed.add(j.jobId);
+        // Pre-judge: resolve full JD so OpenAI sees real disqualifiers
+        // buried in the body, not just the 200-char matchSummary preview.
+        // resolveJobDetail is cached so this is cheap on re-runs.
+        console.log('[FF-JRD] auto: resolving full JDs for batch of', batch.length);
+        await resolvePreJudge(batch);
         console.log('[FF-JRD] auto: judging', batch.length, 'jobs via OpenAI…');
         const judge = await aiJudge({
             profile: ctx.profile,

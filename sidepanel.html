@@ -184,8 +184,14 @@
             <small class="hint">Judge + resolve full JD + push to dashboard automatically as you scroll JR.</small>
         </div>
         <div class="row">
-            <label for="auto-batch-size" title="Trigger an auto-judge every N newly captured jobs.">Auto batch size</label>
-            <input id="auto-batch-size" type="number" min="1" max="40" step="1">
+            <label for="auto-batch-size" title="Trigger an auto-judge every N newly captured jobs. Default 5 — judges on full JD so larger batches inflate latency + token cost.">Auto batch size</label>
+            <input id="auto-batch-size" type="number" min="1" max="20" step="1">
+        </div>
+        <div class="row">
+            <label for="shortcuts-enabled" title="When on: S=start, D=stop, K=stop&push, P=push picks, R=reset, ?=help. Off by default to avoid hijacking typing.">
+                <input id="shortcuts-enabled" type="checkbox"> Keyboard shortcuts
+            </label>
+            <small class="hint">Off by default. Press <kbd>?</kbd> after enabling to see all keys.</small>
         </div>
         <div class="row info-block">
             Backend URLs are pinned in <code>exports.js</code>. OpenAI key + model + candidate summary are managed in the Clients-Tracking portal.

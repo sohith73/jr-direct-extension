@@ -51,6 +51,7 @@ const els = {
     aiThreshold: $('ai-threshold'),
     autoMode: $('auto-mode'),
     autoBatchSize: $('auto-batch-size'),
+    shortcutsEnabled: $('shortcuts-enabled'),
     saveConfig: $('save-config'),
     configDetails: $('config-details'),
 
@@ -111,6 +112,7 @@ let cfg = {
     aiThreshold: 50,
     autoMode: true,
     autoBatchSize: 8,
+    shortcutsEnabled: false,
     authToken: '',
     authEmail: '',
     authName: '',
@@ -365,9 +367,13 @@ function renderCapHitBanner() {
         if (bar) bar.remove();
         return;
     }
-    const total = capInfoCache?.targetJobCount ?? '?';
+    // Prefer effectiveCap (incl. server-side default of 30) over the explicit
+    // targetJobCount which is null for clients without an admin-set value.
+    const total = capInfoCache?.effectiveCap ?? capInfoCache?.targetJobCount ?? '?';
+    const isDefault = capInfoCache?.isDefaultCap === true;
     const current = capInfoCache?.currentOps ?? '?';
-    const text = `Client cap reached — ${current} of ${total} jobs already pushed.`;
+    const capLabel = isDefault ? `${total} (default)` : total;
+    const text = `Daily cap reached — ${current} of ${capLabel} pushed today (resets 00:00 IST).`;
     const bumpTo = Number.isFinite(Number(total)) ? Number(total) + CAP_BUMP_DEFAULT : CAP_BUMP_DEFAULT;
     if (!bar) {
         bar = document.createElement('div');
@@ -513,8 +519,13 @@ async function loadDailyStats() {
 
 function renderDailyStats(history) {
     const days = Array.isArray(history?.history) ? history.history : [];
-    const cap = Number.isFinite(Number(history?.capInfo?.targetJobCount)) ? history.capInfo.targetJobCount : null;
-    const remaining = Number.isFinite(Number(history?.capInfo?.remaining)) ? history.capInfo.remaining : null;
+    // effectiveCap is server's authoritative cap (admin-set OR default 30).
+    // targetJobCount stays separate so we can label "default" vs explicit.
+    const ci = history?.capInfo || {};
+    const explicitCap = Number.isFinite(Number(ci.targetJobCount)) ? ci.targetJobCount : null;
+    const cap = Number.isFinite(Number(ci.effectiveCap)) ? ci.effectiveCap : explicitCap;
+    const isDefault = ci.isDefaultCap === true;
+    const remaining = Number.isFinite(Number(ci.remaining)) ? ci.remaining : null;
     const totalOps = history?.totals?.ops || 0;
 
     // Server is source of truth for the cap. If remaining hit 0 mirror that
@@ -522,7 +533,13 @@ function renderDailyStats(history) {
     // the TARGET_REACHED reply (eviction race). Conversely, if dashboard
     // raised the cap we clear the local flag so Start re-enables.
     if (cap != null && Number.isFinite(remaining)) {
-        capInfoCache = { targetJobCount: cap, currentOps: totalOps, remaining };
+        capInfoCache = {
+            targetJobCount: explicitCap,
+            effectiveCap: cap,
+            isDefaultCap: isDefault,
+            currentOps: ci.currentOps ?? totalOps,
+            remaining,
+        };
         const shouldHit = remaining <= 0;
         if (shouldHit !== capHit) {
             capHit = shouldHit;
@@ -532,7 +549,8 @@ function renderDailyStats(history) {
     }
 
     // Mirror cap into the per-client stats tile so the operator never has
-    // to look in two places. Hide the tile when no cap is set.
+    // to look in two places. Cap always shows now (default 30 when admin
+    // hasn't set one), so the tile is always visible.
     if (els.clientCapStat) {
         if (cap == null) {
             els.clientCapStat.style.display = 'none';
@@ -540,7 +558,7 @@ function renderDailyStats(history) {
             els.clientCapStat.style.display = '';
             const rem = remaining == null ? Math.max(0, cap - totalOps) : remaining;
             if (els.capRemaining) els.capRemaining.textContent = String(rem);
-            if (els.capTotal) els.capTotal.textContent = `of ${cap}`;
+            if (els.capTotal) els.capTotal.textContent = isDefault ? `of ${cap} (default)` : `of ${cap}`;
             els.clientCapStat.classList.toggle('over', rem <= 0);
             els.clientCapStat.classList.toggle('warn', rem > 0 && (rem / cap) <= 0.2);
         }
@@ -562,22 +580,22 @@ function renderDailyStats(history) {
 
     if (els.dailyCount) els.dailyCount.textContent = String(todayOps);
 
-    // Cap context line: "of N total cap · X remaining" or "no cap" or
-    // "cap reached" — short + readable.
+    // Cap context line: "· cap N" or "· cap N (default)" — short + readable.
     if (els.dailyCap) {
         if (cap == null) {
             els.dailyCap.textContent = '';
         } else {
-            els.dailyCap.textContent = `· cap ${cap}`;
+            els.dailyCap.textContent = isDefault ? `· cap ${cap} (default)` : `· cap ${cap}`;
         }
     }
     if (els.dailySub) {
+        const capStr = isDefault ? `${cap} (default)` : `${cap}`;
         if (cap == null) {
             els.dailySub.textContent = `${totalOps} total · 14d`;
         } else if (remaining == null || remaining <= 0) {
-            els.dailySub.textContent = `Cap reached — ${totalOps} of ${cap}`;
+            els.dailySub.textContent = `Cap reached — ${totalOps} of ${capStr}`;
         } else {
-            els.dailySub.textContent = `${totalOps}/${cap} total · ${remaining} remaining`;
+            els.dailySub.textContent = `${totalOps}/${capStr} total · ${remaining} remaining`;
         }
     }
 
@@ -681,7 +699,10 @@ function renderSummarySection() {
 function applyState() {
     els.aiThreshold.value = String(cfg.aiThreshold ?? 50);
     if (els.autoMode) els.autoMode.checked = cfg.autoMode !== false;
-    if (els.autoBatchSize) els.autoBatchSize.value = String(cfg.autoBatchSize ?? 8);
+    if (els.autoBatchSize) els.autoBatchSize.value = String(cfg.autoBatchSize ?? 5);
+    if (els.shortcutsEnabled) els.shortcutsEnabled.checked = cfg.shortcutsEnabled === true;
+    const hint = $('shortcut-hint');
+    if (hint) hint.hidden = cfg.shortcutsEnabled !== true;
     els.count.textContent = String(captureCount);
     // Capture-cap color: amber at 80, red at 100.
     if (els.count) {
@@ -700,9 +721,11 @@ function applyState() {
     // In auto-mode the Judge button becomes a "flush remaining" trigger;
     // it stays enabled whenever capture is active (no isJudged gate).
     if (cfg.autoMode !== false) {
-        els.judge.textContent = 'Flush + push';
-        els.judge.title = 'Auto pipeline runs as you scroll. Click to drain anything < batch size.';
-        els.judge.disabled = !captureActive || captureCount === 0 || isProcessing;
+        els.judge.textContent = 'Stop scraping & push';
+        els.judge.title = 'Stops capture, drains anything pending through judge → resolve → push.';
+        // Stay enabled whenever there's something captured (even if capture stopped
+        // because of cap-hit or manual stop) so operator can still flush remainder.
+        els.judge.disabled = captureCount === 0 || isProcessing;
     } else {
         els.judge.textContent = 'Judge captured';
         els.judge.title = '';
@@ -922,7 +945,7 @@ function handlePushProgress({ done, target }) {
 async function loadCfgFromStorage() {
     try {
         const stored = await chrome.storage.local.get([
-            'aiThreshold', 'autoMode', 'autoBatchSize',
+            'aiThreshold', 'autoMode', 'autoBatchSize', 'shortcutsEnabled',
             'openaiKey', 'authToken', 'authEmail', 'authName', 'authProfile',
             'extensionCode', 'operatorName',
         ]);
@@ -1131,6 +1154,7 @@ async function saveConfig() {
         aiThreshold: Number.parseInt(els.aiThreshold.value, 10) || 50,
         autoMode: els.autoMode ? !!els.autoMode.checked : true,
         autoBatchSize: Math.max(1, Math.min(40, Number.parseInt(els.autoBatchSize?.value, 10) || 8)),
+        shortcutsEnabled: els.shortcutsEnabled ? !!els.shortcutsEnabled.checked : false,
     };
     try {
         await chrome.storage.local.set(config);
@@ -1298,10 +1322,15 @@ chrome.runtime.onMessage.addListener((msg) => {
             break;
         case 'phase':
             els.phase.textContent = msg.phase;
+            if (msg.phase === 'resolving-jds') {
+                setProcessing(true, `<span class="step">Resolving JDs</span> 0/${msg.total}…`);
+                pushTickerLine(`→ phase: resolving full JDs (${msg.total} jobs)`, 'batch');
+                setLive('Resolving JDs', `Pulling full job descriptions for ${msg.total} job${msg.total === 1 ? '' : 's'}…`);
+            }
             if (msg.phase === 'judging') {
-                setProcessing(true, `<span class="step">AI judging</span> ${msg.total} captured jobs…`);
+                setProcessing(true, `<span class="step">AI judging</span> ${msg.total} captured jobs (full JD)…`);
                 pushTickerLine(`→ phase: judging (${msg.total} jobs)`, 'batch');
-                setLive('Judging', `Asking GPT to score ${msg.total} job${msg.total === 1 ? '' : 's'}…`);
+                setLive('Judging', `Scoring ${msg.total} job${msg.total === 1 ? '' : 's'} against full JD…`);
             }
             if (msg.phase === 'pushing') {
                 setProgress(0, `<span class="step">Pushing</span> 0/${msg.toPush}…`);
@@ -1340,6 +1369,15 @@ chrome.runtime.onMessage.addListener((msg) => {
                 hideLive(0);
                 // Refresh the daily card so the tile reflects "0 remaining".
                 scheduleDailyRefresh(50);
+            }
+            break;
+        case 'judge-prep':
+            // Pre-judge JD resolve progress. Updates the live bar so the
+            // operator sees "Resolving 3/5 JDs…" before the GPT call fires.
+            if (msg.stage === 'resolving') {
+                setLive('Resolving JDs', `Pulling full descriptions for ${msg.total} job${msg.total === 1 ? '' : 's'}…`);
+            } else if (msg.stage === 'resolved') {
+                setLive('Resolving JDs', `${msg.done || 0}/${msg.total} JDs ready · then GPT scores…`);
             }
             break;
         case 'ai-batch-start': handleAiBatchStart(msg); break;
@@ -1514,6 +1552,8 @@ document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape' && !els.shortcutHelp?.hidden) toggleShortcutHelp(false);
         return;
     }
+    // Esc still closes help even when shortcuts disabled (so a user who
+    // toggled them off mid-overlay can dismiss it).
     if (e.key === 'Escape') {
         if (els.shortcutHelp && !els.shortcutHelp.hidden) {
             toggleShortcutHelp(false);
@@ -1521,6 +1561,7 @@ document.addEventListener('keydown', (e) => {
         }
         return;
     }
+    if (cfg.shortcutsEnabled !== true) return;
     const k = e.key.toLowerCase();
     const sc = SHORTCUTS.find((s) => s.key === k);
     if (!sc) return;
