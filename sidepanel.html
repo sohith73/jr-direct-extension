@@ -199,7 +199,7 @@
             <small class="hint">Judge + resolve full JD + push to dashboard automatically as you scroll JR.</small>
         </div>
         <div class="row">
-            <label for="auto-batch-size" title="Trigger an auto-judge every N newly captured jobs. Default 5 — judges on full JD so larger batches inflate latency + token cost.">Auto batch size</label>
+            <label for="auto-batch-size" title="Trigger an auto-judge every N newly captured jobs. Default 8 — judges in clean batches (8, 16, 24…). Larger batches inflate latency.">Auto batch size</label>
             <input id="auto-batch-size" type="number" min="1" max="20" step="1">
         </div>
         <div class="row">
@@ -241,6 +241,7 @@
 
     <section class="row actions">
         <button id="start" class="primary">Start capture</button>
+        <button id="judge-now" class="primary" title="Judge any captured-but-unprocessed jobs right now without stopping capture. Use when auto-batch hasn't fired yet (e.g. fewer than batch size unprocessed)." disabled>Judge now</button>
         <button id="judge" class="primary green" disabled>Judge captured</button>
         <button id="push" class="primary green" disabled hidden>Push <span id="push-count">0</span></button>
         <button id="reset" class="ghost">Reset</button>

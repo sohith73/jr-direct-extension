@@ -66,6 +66,7 @@ const els = {
 
     // actions
     start: $('start'),
+    judgeNow: $('judge-now'),
     judge: $('judge'),
     push: $('push'),
     pushCount: $('push-count'),
@@ -130,6 +131,9 @@ const CAPTURE_CAP = 100;
 let captureCount = 0;
 let linkedinSkippedCount = 0;
 let captureActive = false;
+// Mirrors background.state.auto.running. Disables Stop & push during auto-
+// batch judging so the operator can't click mid-batch + see stale stats.
+let autoRunning = false;
 let isProcessing = false;
 let isJudged = false;
 let isResolving = false;
@@ -499,25 +503,41 @@ function scheduleDailyRefresh(delayMs = 1500) {
 async function loadDailyStats() {
     if (!cfg.authEmail) return;
     if (_dailyLoadInflight) return _dailyLoadInflight;
-    // Today-only endpoint. Combines server-truth ops count + extension session
-    // stats (captures, linkedinSkipped, role-miss) into one payload so we
-    // don't need /push-history's 14-day history any more.
-    const url = `${API_BASE_URL.replace(/\/+$/, '')}/extension/today-stats?clientEmail=${encodeURIComponent(cfg.authEmail)}`;
+
+    // SCRAPED / LINKEDIN / ROLE-MISS / PUSHED are sourced from the SW's
+    // local todayMetrics accumulator (always accurate from operator's POV).
+    // Server is consulted ONLY for cap state + lifetime-pushed cross-check
+    // so the cap-hit gate stays in sync with /addjob.
+    const emailLower = String(cfg.authEmail || '').trim().toLowerCase();
+    const url = `${API_BASE_URL.replace(/\/+$/, '')}/extension/today-stats?clientEmail=${encodeURIComponent(emailLower)}&_=${Date.now()}`;
     _dailyLoadInflight = (async () => {
-        let res;
+        // 1. Pull SW state for the local todayMetrics.
+        const swState = await send('jrd-state').catch(() => null);
+        const local = swState?.todayMetrics || {};
+
+        // 2. Pull server for cap + server-truth pushed cross-check.
+        let server = null;
         try {
-            res = await fetch(url);
+            const res = await fetch(url, { cache: 'no-store' });
+            const body = await res.json().catch(() => null);
+            if (res.ok && body?.success) server = body;
+            else console.warn('[FF-JRD] today-stats non-ok', res.status, body);
         } catch (e) {
             console.warn('[FF-JRD] today-stats fetch threw', e?.message);
-            return;
         }
-        let body = null;
-        try { body = await res.json(); } catch {}
-        if (!res.ok || !body?.success) {
-            console.warn('[FF-JRD] today-stats non-ok', res.status, body);
-            return;
-        }
-        renderTodayStats(body);
+
+        const payload = {
+            captures:        Number(local.captures) || 0,
+            linkedinSkipped: Number(local.linkedinSkipped) || 0,
+            roleMismatch:    Number(local.roleMismatch) || 0,
+            pushed:          Number(local.pushed) || 0,
+            serverPushed:    Number(server?.pushed) || 0,
+            cap:             Number(server?.cap) || 0,
+            isDefaultCap:    server?.isDefaultCap === true,
+            remaining:       server?.remaining,
+        };
+        console.log('[FF-JRD] today-stats render', payload);
+        renderTodayStats(payload);
     })();
     try { await _dailyLoadInflight; }
     finally { _dailyLoadInflight = null; }
@@ -527,9 +547,28 @@ async function loadDailyStats() {
 // LinkedIn skip / Role-miss) + cap progress bar. No history bars. Source:
 // /extension/today-stats — combines ExtensionSessionStat (today) + JobModel
 // ops count (today) + ProfileModel.targetJobCount.
+// renderTodayStats: paint the four TODAY tiles from a single source.
+//
+// payload shape:
+//   {
+//     captures, linkedinSkipped, pushed, roleMismatch  ← local accumulator
+//     cap, isDefaultCap, remaining                     ← server cap state
+//   }
+//
+// SCRAPED / LINKEDIN SKIP / ROLE-MISS read directly from the extension's
+// local `state.todayMetrics` (incremented on every event, persisted to
+// chrome.storage.local, IST-day-bucketed). PUSHED is also local but
+// validated against server-truth (capInfo) on every refresh — if the cap
+// math says we've already pushed N today, we use max(local, server).
+// This guarantees the operator-visible numbers are always accurate even
+// when network is flaky.
 function renderTodayStats(payload) {
-    const t = payload?.today || {};
-    const pushed = Number(payload?.pushed || 0);
+    const captures = Number(payload?.captures || 0);
+    const linkedinSkipped = Number(payload?.linkedinSkipped || 0);
+    const roleMismatch = Number(payload?.roleMismatch || 0);
+    const localPushed = Number(payload?.pushed || 0);
+    const serverPushed = Number(payload?.serverPushed || 0);
+    const pushed = Math.max(localPushed, serverPushed);
     const cap = Number(payload?.cap || 0);
     const isDefault = payload?.isDefaultCap === true;
     const remaining = Number.isFinite(Number(payload?.remaining))
@@ -537,22 +576,24 @@ function renderTodayStats(payload) {
         : Math.max(0, cap - pushed);
 
     // Cap-gate sync — keep capHit + banner in step with server truth.
-    capInfoCache = {
-        targetJobCount: isDefault ? null : cap,
-        effectiveCap: cap,
-        isDefaultCap: isDefault,
-        currentOps: pushed,
-        remaining,
-    };
-    const shouldHit = cap > 0 && remaining <= 0;
-    if (shouldHit !== capHit) {
-        capHit = shouldHit;
-        renderCapHitBanner();
-        applyState();
+    if (cap > 0) {
+        capInfoCache = {
+            targetJobCount: isDefault ? null : cap,
+            effectiveCap: cap,
+            isDefaultCap: isDefault,
+            currentOps: pushed,
+            remaining,
+        };
+        const shouldHit = remaining <= 0;
+        if (shouldHit !== capHit) {
+            capHit = shouldHit;
+            renderCapHitBanner();
+            applyState();
+        }
     }
 
     // Per-client stats tile (sidebar) mirrors cap progress.
-    if (els.clientCapStat) {
+    if (els.clientCapStat && cap > 0) {
         els.clientCapStat.style.display = '';
         if (els.capRemaining) els.capRemaining.textContent = String(remaining);
         if (els.capTotal) els.capTotal.textContent = isDefault ? `of ${cap} (default)` : `of ${cap}`;
@@ -560,31 +601,24 @@ function renderTodayStats(payload) {
         els.clientCapStat.classList.toggle('warn', remaining > 0 && (remaining / Math.max(cap, 1)) <= 0.2);
     }
 
-    // Four today tiles.
+    // Four today tiles — single source: local todayMetrics.
     const set = (id, val) => { const el = $(id); if (el) el.textContent = String(val); };
-    set('today-captures', t.captures || 0);
+    set('today-captures', captures);
     set('today-pushed',   pushed);
-    set('today-linkedin', t.linkedinSkipped || 0);
-    set('today-rolemiss', t.roleMismatch || 0);
+    set('today-linkedin', linkedinSkipped);
+    set('today-rolemiss', roleMismatch);
 
-    // Pushed tile sub-text shows cap.
     const subEl = $('today-cap');
-    if (subEl) subEl.textContent = isDefault ? `of ${cap} (default)` : `of ${cap}`;
+    if (subEl) subEl.textContent = cap > 0 ? (isDefault ? `of ${cap} (default)` : `of ${cap}`) : '';
     const pushedTile = subEl?.parentElement;
-    if (pushedTile) {
+    if (pushedTile && cap > 0) {
         pushedTile.classList.toggle('over', remaining <= 0);
         pushedTile.classList.toggle('warn', remaining > 0 && remaining <= 5);
     }
 
-    // Sub-line: just "resets at 00:00 IST" + ext session count.
-    if (els.dailySub) {
-        const sess = t.sessions || 0;
-        els.dailySub.textContent = sess > 0
-            ? `${sess} session${sess === 1 ? '' : 's'} · resets 00:00 IST`
-            : 'resets at 00:00 IST';
-    }
+    if (els.dailySub) els.dailySub.textContent = 'resets at 00:00 IST';
 
-    // Cap progress bar — pushed/cap.
+    // Cap progress bar — pushed / cap.
     if (els.dailyFill) {
         const pct = cap > 0 ? Math.min(100, Math.round((pushed / cap) * 100)) : 0;
         els.dailyFill.style.width = `${pct}%`;
@@ -663,7 +697,7 @@ function renderSummarySection() {
 function applyState() {
     els.aiThreshold.value = String(cfg.aiThreshold ?? 50);
     if (els.autoMode) els.autoMode.checked = cfg.autoMode !== false;
-    if (els.autoBatchSize) els.autoBatchSize.value = String(cfg.autoBatchSize ?? 5);
+    if (els.autoBatchSize) els.autoBatchSize.value = String(cfg.autoBatchSize ?? 8);
     if (els.shortcutsEnabled) els.shortcutsEnabled.checked = cfg.shortcutsEnabled === true;
     const hint = $('shortcut-hint');
     if (hint) hint.hidden = cfg.shortcutsEnabled !== true;
@@ -676,9 +710,13 @@ function applyState() {
     els.linkedinSkippedCount.textContent = String(linkedinSkippedCount);
     els.activeState.textContent = captureActive ? 'YES' : 'no';
     els.statusDot.classList.toggle('active', !!captureActive);
-    els.start.disabled = !!captureActive || isProcessing || capHit;
+    // Start disabled while session live OR an auto-batch is running OR a
+    // manual flush is processing OR the client cap is reached.
+    els.start.disabled = !!captureActive || isProcessing || autoRunning || capHit;
     if (capHit) {
         els.start.title = 'Client cap reached — raise the target on the dashboard before scraping more.';
+    } else if (autoRunning) {
+        els.start.title = 'Auto-batch in flight — wait for current batch to finish.';
     } else {
         els.start.title = '';
     }
@@ -690,20 +728,47 @@ function applyState() {
             els.judge.title = 'Pipeline draining — judge → resolve → push.';
             els.judge.disabled = true;
         } else {
-            els.judge.textContent = captureCount > 0
-                ? `Stop scraping & push (${captureCount})`
-                : 'Stop scraping & push';
-            els.judge.title = 'Stops capture, drains pending through judge → resolve → push, then re-arms Start.';
-            // Stay enabled whenever there's something captured (even after cap-hit
-            // or manual stop) so operator can still flush remainder. After flush
-            // completes runJudge clears the buffer → button auto-disables.
-            els.judge.disabled = captureCount === 0 || isProcessing;
+            // Stop & push stays clickable even during auto-batch — flushAutoBatch
+            // queues behind the in-flight promise and drains the rest. UI label
+            // hints at the queueing.
+            const stopLabel = autoRunning
+                ? `Stop & push (queue · ${captureCount})`
+                : (captureCount > 0 ? `Stop scraping & push (${captureCount})` : 'Stop scraping & push');
+            els.judge.textContent = stopLabel;
+            els.judge.title = autoRunning
+                ? 'Auto-batch in flight. Click to queue Stop & Push for after it finishes.'
+                : 'Stops capture, drains pending through judge → resolve → push.';
+            els.judge.disabled = captureCount === 0;
+        }
+        // Judge now button — drains current pending without stopping capture.
+        // Stays clickable during autoRunning (queues for after) so operator
+        // never feels locked out. Disabled only during the single-shot
+        // manual flush (isProcessing) or when there's nothing to judge.
+        if (els.judgeNow) {
+            if (isProcessing) {
+                els.judgeNow.textContent = 'Working…';
+                els.judgeNow.disabled = true;
+            } else if (autoRunning) {
+                els.judgeNow.textContent = captureCount > 0
+                    ? `Judge now (queue · ${captureCount})`
+                    : 'Judging…';
+                els.judgeNow.title = 'Auto-batch in flight. Click to queue another drain after it finishes.';
+                els.judgeNow.disabled = captureCount === 0;
+            } else {
+                els.judgeNow.textContent = captureCount > 0
+                    ? `Judge now (${captureCount})`
+                    : 'Judge now';
+                els.judgeNow.title = 'Process pending captures right now without stopping capture.';
+                els.judgeNow.disabled = captureCount === 0 || capHit;
+            }
         }
     } else {
         els.judge.textContent = 'Judge captured';
         els.judge.title = '';
         els.judge.disabled = !captureActive || captureCount === 0 || isProcessing || isJudged;
+        if (els.judgeNow) els.judgeNow.hidden = true;
     }
+    if (cfg.autoMode !== false && els.judgeNow) els.judgeNow.hidden = false;
     els.push.hidden = !isJudged || cfg.autoMode !== false;
     if (isJudged) updatePushButton();
 }
@@ -936,6 +1001,7 @@ async function refreshState() {
         captureCount = s.capture?.count || 0;
         linkedinSkippedCount = s.capture?.linkedinSkipped || 0;
         captureActive = !!s.capture?.active;
+        autoRunning = !!s.auto?.running;
         capHit = !!s.auto?.capHit;
         capInfoCache = s.auto?.capInfo || null;
         if (s.lastResult && Array.isArray(s.lastResult.decisions)) {
@@ -1175,13 +1241,42 @@ async function startCapture() {
     } else { setMessage('Failed to start capture.', 'error'); }
 }
 
+// runJudgeNow: process anything captured-but-unprocessed RIGHT NOW without
+// halting capture. Use when auto-batch hasn't fired yet (pending count
+// stuck below batch threshold) or when the SW's auto.running flag wedged.
+// Capture stays active so operator can keep scrolling.
+async function runJudgeNow() {
+    if (cfg.autoMode === false) return; // manual mode uses old runJudge path
+    setProcessing(true, '<span class="step">Judge now</span> — processing remaining captures…');
+    setMessage('Judging unprocessed captures… capture stays active.');
+    setLive('Judging', `Processing pending jobs (capture continues)…`);
+    applyState();
+    const r = await send('jrd-flush-auto');
+    setProcessing(false);
+    if (!r?.ok) {
+        setMessage(`Judge now failed: ${r?.error || 'UNEXPECTED'} ${r?.message || ''}`, 'error');
+        applyState();
+        return;
+    }
+    const s = r.stats || {};
+    setMessage(
+        `✓ Processed — judged ${s.judged || 0} · picks ${s.picks || 0} · pushed ${s.pushed || 0} · dupes ${s.dupes || 0} · blocked ${s.blocked || 0} · errors ${s.errors || 0}. Capture still active.`,
+        'ok',
+    );
+    pushTickerLine(`✓ judge-now — pushed ${s.pushed || 0} / picks ${s.picks || 0}`);
+    applyState();
+    // Refresh today tile so SCRAPED / PUSHED reflect the just-processed batch.
+    setTimeout(() => loadDailyStats().catch(() => {}), 600);
+}
+
 async function runJudge() {
     // In auto-mode, the SW pipelines judge → resolve → push as the operator
-    // scrolls. Manual click here drains anything not yet auto-batched, halts
-    // capture, then resets the buffer so Start is armed for a fresh session.
+    // scrolls. Manual click here drains anything not yet auto-batched and
+    // halts capture. Buffer + stats stay visible so the operator can see the
+    // session summary ("12 scraped · 3 pushed") until they click Start to
+    // begin a fresh session — Start is the explicit reset trigger.
     if (cfg.autoMode !== false) {
-        // 1. Halt fresh ingest first so no new captures land mid-flush. SW
-        //    leaves the buffer intact for the auto-pipeline to drain.
+        // 1. Halt fresh ingest. SW keeps the buffer for auto-pipeline drain.
         await send('jrd-stop-capture').catch(() => {});
         captureActive = false;
 
@@ -1203,29 +1298,23 @@ async function runJudge() {
         }
         const s = r.stats || {};
 
-        // 3. Show summary — bold + green so operator can't miss it.
+        // 3. Show summary — persistent until next Start. Buffer + counts stay.
         const totalsLine = `judged ${s.judged || 0} · picks ${s.picks || 0} · pushed ${s.pushed || 0} · dupes ${s.dupes || 0} · blocked ${s.blocked || 0} · errors ${s.errors || 0}`;
-        setMessage(`✓ Done — ${totalsLine}. Buffer cleared, ready to capture again.`, 'ok');
+        setMessage(`✓ Session done — ${totalsLine}. Click Start to scrape more.`, 'ok');
         pushTickerLine(`✓ flushed — pushed ${s.pushed || 0} / picks ${s.picks || 0}`);
-        setLive('Done', `Pushed ${s.pushed || 0} of ${s.picks || 0} picks. Click Start to scrape more.`, 'success');
+        setLive('Done', `Pushed ${s.pushed || 0} of ${s.picks || 0} picks · ${captureCount} scraped. Click Start for next session.`, 'success');
 
-        // 4. Auto-clear capture buffer so captureCount=0 and Start re-arms.
-        //    Wait for the SW to settle so the response carries fresh state.
-        await send('jrd-clear-capture').catch(() => {});
-        captureCount = 0;
-        captureActive = false;
-        linkedinSkippedCount = 0;
-        if (els.count) els.count.textContent = '0';
-        if (els.linkedinSkippedCount) els.linkedinSkippedCount.textContent = '0';
-
-        // 5. Re-pull state from SW — covers any remaining flags and ensures
-        //    the Start button condition (!captureActive && !isProcessing &&
-        //    !capHit) actually becomes true.
+        // 4. Settle SW state. Don't clear — captureCount + stats stay visible.
         setProcessing(false);
         await refreshState().catch(() => {});
 
-        // 6. Visual nudge — flash Start button green so operator sees it's
-        //    armed. CSS `start-armed` is removed after 1.6s.
+        // 5. Refresh today tile so SCRAPED / PUSHED / LINKEDIN populate from
+        //    the just-logged ExtensionSessionStat row. SW's reportSessionStat
+        //    fires inside flush; give it a beat then pull.
+        setTimeout(() => loadDailyStats().catch(() => {}), 800);
+        setTimeout(() => loadDailyStats().catch(() => {}), 2500);
+
+        // 6. Visual nudge — flash Start button green.
         if (els.start && !els.start.disabled) {
             els.start.classList.add('start-armed');
             setTimeout(() => els.start?.classList.remove('start-armed'), 1600);
@@ -1323,6 +1412,21 @@ function toggleCardPick(jobId) {
 chrome.runtime.onMessage.addListener((msg) => {
     if (!msg) return;
     switch (msg.type) {
+        case 'today-metrics':
+            // Live SW broadcast every time bumpToday() fires. Repaint tiles
+            // immediately — no round-trip needed. Server fetch still runs
+            // in the background to keep cap state fresh.
+            renderTodayStats({
+                captures:        Number(msg.captures) || 0,
+                linkedinSkipped: Number(msg.linkedinSkipped) || 0,
+                roleMismatch:    Number(msg.roleMismatch) || 0,
+                pushed:          Number(msg.pushed) || 0,
+                serverPushed:    Number(capInfoCache?.currentOps) || 0,
+                cap:             Number(capInfoCache?.effectiveCap) || 0,
+                isDefaultCap:    capInfoCache?.isDefaultCap === true,
+                remaining:       capInfoCache?.remaining,
+            });
+            break;
         case 'count':
             captureCount = msg.count;
             applyState();
@@ -1420,12 +1524,21 @@ chrome.runtime.onMessage.addListener((msg) => {
             if (msg.outcome === 'pushed') scheduleDailyRefresh();
             break;
         case 'auto-batch-start':
+            autoRunning = true;
+            applyState();
             pushTickerLine(`⚙ auto batch — ${msg.size} jobs → judging`, 'batch');
             ensureSectionVisible();
             resetLiveCounts();
             setLive('Auto batch', `Judging ${msg.size} captured job${msg.size === 1 ? '' : 's'} via OpenAI…`);
             break;
         case 'auto-batch-end':
+            autoRunning = false;
+            applyState();
+            // Clear the in-progress bar regardless of success/error so the
+            // panel doesn't get stuck mid-batch (e.g. PROFILE_LOAD error
+            // leaving the "AI judging 8/8" bar frozen).
+            setProgress(0, '');
+            if (els.progressSection) els.progressSection.hidden = true;
             if (msg.error) {
                 pushTickerLine(`✗ auto batch error: ${msg.error}`, 'batch');
                 setLive('Batch error', String(msg.error), 'error');
@@ -1510,6 +1623,7 @@ const shortcutHintBtn = $('shortcut-hint');
 if (shortcutHintBtn) shortcutHintBtn.addEventListener('click', () => toggleShortcutHelp());
 els.saveConfig.addEventListener('click', saveConfig);
 els.start.addEventListener('click', startCapture);
+els.judgeNow.addEventListener('click', runJudgeNow);
 els.judge.addEventListener('click', runJudge);
 els.push.addEventListener('click', runPush);
 els.reset.addEventListener('click', resetCapture);

@@ -18,7 +18,7 @@ const DEFAULTS = {
     // automatically as the operator scrolls. Triggers a batch every
     // `autoBatchSize` newly captured jobs. No manual Push needed.
     autoMode: true,
-    autoBatchSize: 5,
+    autoBatchSize: 8,
     autoPushConcurrency: 3,
     // OpenAI direct-call config — must be in DEFAULTS so loadConfig() pulls
     // it from chrome.storage.local after SW eviction. Without this in the
@@ -51,6 +51,19 @@ const state = {
         jobs: new Map(), // jobId → scraped card
         linkedinSkipped: new Map(), // jobId → applyLink (visible-to-operator log)
     },
+    // Per-day local accumulator — survives session resets, panel reloads,
+    // and SW eviction. Source of truth for the extension's "Today" tile.
+    // Date-stamped so it auto-resets at IST midnight on first event of the
+    // new day. Persisted to chrome.storage.local under TODAY_KEY.
+    todayMetrics: {
+        date: '',           // YYYY-MM-DD in IST
+        client: '',         // client email — resets when client switches
+        captures: 0,        // total job cards scraped today (incl. LinkedIn)
+        linkedinSkipped: 0, // LinkedIn-only postings filtered out
+        pushed: 0,          // successfully landed in dashboard tracker
+        roleMismatch: 0,    // AI rejected: title doesn't match preferred roles
+        otherSkip: 0,       // threshold + seniority + location + auth + other
+    },
     // After judgeOnly: { decisions, jobs, completedAt } — used by pushSelected.
     judged: null,
     lastResult: null,
@@ -79,6 +92,74 @@ const PERSIST_KEYS = {
     captureStartedAt: 'jrd_capture_startedAt',
     judged: 'jrd_judged',
 };
+const TODAY_KEY = 'jrd_today_metrics';
+
+// IST date string ("YYYY-MM-DD"). Used as the bucket key for todayMetrics
+// so the counters auto-reset at 00:00 IST without a cron job. IST is fixed
+// UTC+5:30 (no DST), so we shift current UTC by 5.5h and slice.
+function istDateKey(now = new Date()) {
+    const ist = new Date(now.getTime() + 5.5 * 60 * 60 * 1000);
+    return ist.toISOString().slice(0, 10);
+}
+
+// Pull persisted today-metrics from chrome.storage.local at SW boot. Resets
+// when the date changes (operator left the panel open across midnight) or
+// when the active client switches (each client has its own bucket).
+async function loadTodayMetrics() {
+    try {
+        const s = await chrome.storage.local.get(TODAY_KEY);
+        const persisted = s?.[TODAY_KEY];
+        if (persisted && typeof persisted === 'object' && persisted.date === istDateKey()) {
+            state.todayMetrics = {
+                date: persisted.date,
+                client: persisted.client || '',
+                captures: Number(persisted.captures) || 0,
+                linkedinSkipped: Number(persisted.linkedinSkipped) || 0,
+                pushed: Number(persisted.pushed) || 0,
+                roleMismatch: Number(persisted.roleMismatch) || 0,
+                otherSkip: Number(persisted.otherSkip) || 0,
+            };
+        } else {
+            resetTodayMetrics(persisted?.client || '');
+        }
+    } catch {}
+}
+
+async function persistTodayMetrics() {
+    try {
+        await chrome.storage.local.set({ [TODAY_KEY]: state.todayMetrics });
+    } catch {}
+}
+
+function resetTodayMetrics(client = '') {
+    state.todayMetrics = {
+        date: istDateKey(),
+        client,
+        captures: 0,
+        linkedinSkipped: 0,
+        pushed: 0,
+        roleMismatch: 0,
+        otherSkip: 0,
+    };
+    persistTodayMetrics();
+}
+
+// Increment a metric. Auto-rolls over at IST midnight + auto-resets when
+// the active client changes (per-client buckets). All inc paths funnel
+// through here so persistence + roll-over are consistent.
+function bumpToday(field, delta = 1) {
+    const today = istDateKey();
+    const activeClient = String(state.config.authEmail || '').trim().toLowerCase();
+    if (state.todayMetrics.date !== today
+        || (activeClient && state.todayMetrics.client && state.todayMetrics.client !== activeClient)) {
+        resetTodayMetrics(activeClient);
+    } else if (activeClient && !state.todayMetrics.client) {
+        state.todayMetrics.client = activeClient;
+    }
+    state.todayMetrics[field] = (Number(state.todayMetrics[field]) || 0) + Number(delta || 0);
+    persistTodayMetrics();
+    notifyPopup('today-metrics', { ...state.todayMetrics });
+}
 
 async function persistCapture() {
     try {
@@ -122,6 +203,7 @@ async function restoreState() {
     } catch (e) { console.warn('[FF-JRD] restoreState failed', e?.message); }
 }
 restoreState();
+loadTodayMetrics();
 
 // Sidepanel opens a persistent port for keepalive — incoming pings reset
 // the SW idle timer so long-running awaits (login, judge batches, push)
@@ -240,8 +322,29 @@ function ingestCards(jobs) {
         }
     }
     if (added > 0) persistCapture();
+    // Local today accumulator — survives panel reload, SW eviction, session
+    // reset. Source of truth for the extension's TODAY tile. Counts every
+    // captured card (incl. ones that later get LinkedIn-skipped or
+    // role-rejected, per the user's rule "total includes skipped too").
+    if (added > 0) bumpToday('captures', added);
+    // Backend heartbeat for the admin "Today" tile (cross-operator view).
+    if (added > 0) scheduleSessionHeartbeat();
     // Auto pipeline: kick a batch when enough unprocessed jobs accumulate.
     if (state.config.autoMode) tryAutoBatch();
+}
+
+let _heartbeatTimer = null;
+let _heartbeatLastSent = 0;
+function scheduleSessionHeartbeat() {
+    const HEARTBEAT_INTERVAL_MS = 5000;
+    if (_heartbeatTimer) return;
+    const now = Date.now();
+    const wait = Math.max(0, HEARTBEAT_INTERVAL_MS - (now - _heartbeatLastSent));
+    _heartbeatTimer = setTimeout(() => {
+        _heartbeatTimer = null;
+        _heartbeatLastSent = Date.now();
+        reportSessionStat('heartbeat').catch(() => {});
+    }, wait);
 }
 
 // ---- dashboard helpers ---------------------------------------------------
@@ -1639,10 +1742,11 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
         };
     }
 
-    // Batch in chunks of 5 — picks now judge against the FULL JD (composed
-    // by resolvePreJudge), so each batch is ~4× the input token weight of
-    // the old preview-only path. 5 keeps latency under 6s on gpt-4o-mini.
-    const BATCH = 5;
+    // Batch in chunks of 8 — matches DEFAULTS.autoBatchSize so a single
+    // auto-batch trigger maps to ONE OpenAI call (no internal split).
+    // 8 jobs × 4500 char JDs ≈ 9k input tokens — still under gpt-4o-mini's
+    // 8s typical latency window.
+    const BATCH = 8;
     const decisions = [];
     const jobsById = new Map(jobs.map((j) => [j.jobId, j]));
     const totalBatches = Math.ceil(jobs.length / BATCH);
@@ -1850,6 +1954,7 @@ async function autoPushOne(job, decision) {
     if (r.ok) {
         outcome = 'pushed';
         state.auto.stats.pushed += 1;
+        bumpToday('pushed', 1);
     } else if (body?.message?.toLowerCase?.().includes('duplicate') || r.status === 409) {
         outcome = 'duplicate';
         outcomeDetail = body?.message || 'duplicate';
@@ -1881,8 +1986,10 @@ async function autoPushOne(job, decision) {
 // runAutoBatch: judge a slice → for picks, resolve+push in parallel.
 // Updates state.judged so manual UI keeps a usable history.
 async function runAutoBatch(batch) {
-    if (state.auto.running) return;
+    if (state.auto.running) return state.auto.runningPromise;
     state.auto.running = true;
+    let resolveRunning;
+    state.auto.runningPromise = new Promise((r) => { resolveRunning = r; });
     const t0 = Date.now();
     console.log('[FF-JRD] auto: runAutoBatch START — size=' + batch.length);
     notifyPopup('auto-batch-start', { size: batch.length });
@@ -1923,11 +2030,16 @@ async function runAutoBatch(batch) {
         // helps pinpoint why low-pick clients are low (bad role list vs bad
         // threshold). Stored as a flat object: { 'role-mismatch':3, 'threshold':1, ... }
         if (!state.auto.stats.skipsByKind) state.auto.stats.skipsByKind = {};
+        let roleMissDelta = 0, otherSkipDelta = 0;
         for (const d of judge.decisions) {
             if (d.pick === true) continue;
             const k = d.skipKind || 'threshold';
             state.auto.stats.skipsByKind[k] = (state.auto.stats.skipsByKind[k] || 0) + 1;
+            if (k === 'role-mismatch') roleMissDelta += 1;
+            else otherSkipDelta += 1;
         }
+        if (roleMissDelta) bumpToday('roleMismatch', roleMissDelta);
+        if (otherSkipDelta) bumpToday('otherSkip', otherSkipDelta);
         console.log('[FF-JRD] auto: judge done —', picks.length, 'picks /', batch.length, 'judged');
 
         // Stitch into state.judged so the side panel + history reflect it.
@@ -1959,6 +2071,8 @@ async function runAutoBatch(batch) {
         notifyPopup('auto-batch-end', { stats: { ...state.auto.stats } });
     } finally {
         state.auto.running = false;
+        try { resolveRunning && resolveRunning(); } catch {}
+        state.auto.runningPromise = null;
         // Maybe more captures arrived while we ran — drain.
         if (state.config.autoMode) setTimeout(() => tryAutoBatch(), 0);
     }
@@ -1997,19 +2111,47 @@ function tryAutoBatch() {
     runAutoBatch(pending).catch((e) => console.warn('[FF-JRD] runAutoBatch threw', e?.message));
 }
 
-// flushAutoBatch: drain whatever's pending regardless of size. Called on
-// stop-capture so a half-batch isn't stranded.
+// flushAutoBatch: drain whatever's pending regardless of size. Awaits any
+// in-flight batch first so the operator's "Stop & push" click reflects the
+// FINAL stats, not stats captured mid-batch. Loops until processed catches
+// up to capture.jobs so leftover < BATCH_SIZE jobs don't get stranded.
 async function flushAutoBatch() {
     if (state.auto.capHit) return;
     if (!state.config.autoMode) return;
-    if (state.auto.running) return;
     if (!state.config.authEmail || !state.config.openaiKey) return;
-    const pending = [];
-    for (const j of state.capture.jobs.values()) {
-        if (!state.auto.processed.has(j.jobId)) pending.push(j);
+
+    // 1. If a batch is already running, wait for it to finish before deciding
+    //    if more pending exists. Without this the flush returns immediately
+    //    with stale stats and the UI shows zeros while the SW is still
+    //    pushing in the background.
+    //    Defensive: if running===true but runningPromise===null (SW evicted
+    //    mid-batch, leaving the flag wedged), force-clear so the flush
+    //    doesn't hang forever. User-facing "Judge now" button relies on
+    //    this so a stuck pipeline doesn't lock them out.
+    let waitSafety = 0;
+    while (state.auto.running && waitSafety++ < 60) {
+        if (!state.auto.runningPromise) {
+            console.warn('[FF-JRD] auto.running stuck without promise — clearing');
+            state.auto.running = false;
+            break;
+        }
+        try { await state.auto.runningPromise; } catch {}
     }
-    if (pending.length === 0) return;
-    await runAutoBatch(pending);
+
+    // 2. Loop: drain pending in batches until none left. Each iteration
+    //    triggers a fresh runAutoBatch that processes everything still
+    //    unprocessed (no size threshold — flush is "drain everything").
+    let safety = 50; // guard against infinite loops if processed bookkeeping breaks
+    while (safety-- > 0) {
+        const pending = [];
+        for (const j of state.capture.jobs.values()) {
+            if (!state.auto.processed.has(j.jobId)) pending.push(j);
+        }
+        if (pending.length === 0) return;
+        await runAutoBatch(pending);
+        // After runAutoBatch, runningPromise is cleared; if more captures
+        // arrived during the run, the next iteration picks them up.
+    }
 }
 
 // reportSessionStat: POST one row to /extension/session-stat so the AI
@@ -2024,8 +2166,15 @@ async function reportSessionStat(reason = 'stop') {
         const captures = state.capture.jobs?.size || 0;
         const linkedinSkipped = state.capture.linkedinSkipped?.size || 0;
         const stats = state.auto.stats || {};
-        // Skip empty noise — if operator opened panel, did nothing, hit Stop.
-        if (captures === 0 && (stats.judged || 0) === 0 && (stats.pushed || 0) === 0) return;
+        // Skip empty noise on stop/clear with nothing happening. Heartbeats
+        // (`reason==='heartbeat'`) bypass this so the SCRAPED counter still
+        // populates the moment the first capture lands.
+        if (
+            reason !== 'heartbeat'
+            && captures === 0
+            && (stats.judged || 0) === 0
+            && (stats.pushed || 0) === 0
+        ) return;
         const startedAt = state.capture.startedAt
             ? new Date(state.capture.startedAt).toISOString()
             : null;
@@ -2044,6 +2193,9 @@ async function reportSessionStat(reason = 'stop') {
             - skipsRollup.locationMismatch - skipsRollup.authMismatch
             - skipsRollup.threshold - skipsRollup.companyBlocked;
         const body = {
+            // sessionId enables backend upsert — heartbeats during capture
+            // mutate the same row instead of inserting one-per-event.
+            sessionId: state.capture.sessionId || '',
             extensionCode: state.config.extensionCode || '',
             operatorName,
             clientEmail,
@@ -2321,11 +2473,16 @@ function dispatchMessage(msg, _sender, sendResponse) {
             added += 1;
         }
         if (added > 0) {
+            // LinkedIn-skipped cards still count toward "total scraped today"
+            // per operator rule, but get their own bucket too.
+            bumpToday('captures', added);
+            bumpToday('linkedinSkipped', added);
             notifyPopup('linkedin-skip', {
                 count: state.capture.linkedinSkipped.size,
                 added,
                 latest: msg.jobs.slice(-3),
             });
+            scheduleSessionHeartbeat();
         }
         return false;
     }
@@ -2371,6 +2528,7 @@ function dispatchMessage(msg, _sender, sendResponse) {
                 capHit: state.auto.capHit,
                 capInfo: state.auto.capInfo,
             },
+            todayMetrics: { ...state.todayMetrics },
             lastResult: state.lastResult,
         });
         return true;
@@ -2432,6 +2590,11 @@ function dispatchMessage(msg, _sender, sendResponse) {
         }
         state.capture.active = true;
         state.capture.startedAt = new Date().toISOString();
+        // Mint a stable per-session id. Backend upserts heartbeats on this so
+        // SCRAPED counter updates in real time instead of waiting for stop.
+        state.capture.sessionId =
+            (crypto?.randomUUID?.() ||
+             `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
         state.capture.jobs = new Map();
         state.capture.linkedinSkipped = new Map();
         state.judged = null;
