@@ -39,13 +39,16 @@ const els = {
     liveDetail: $('live-detail'),
     liveCounts: $('live-counts'),
 
-    // daily progress card
-    dailyCard: $('daily-card'),
-    dailyCount: $('daily-count'),
-    dailyCap: $('daily-cap'),
-    dailySub: $('daily-sub'),
-    dailyFill: $('daily-fill'),
-    dailySpark: $('daily-spark'),
+    // today card (4-tile, today-only)
+    dailyCard:    $('daily-card'),
+    dailySub:     $('daily-sub'),
+    dailyFill:    $('daily-fill'),
+    todayRefresh: $('today-refresh'),
+    todayCaptures: $('today-captures'),
+    todayPushed:   $('today-pushed'),
+    todayLinkedin: $('today-linkedin'),
+    todayRolemiss: $('today-rolemiss'),
+    todayCap:      $('today-cap'),
 
     // settings (minimal — only cadence, threshold, auto toggle)
     aiThreshold: $('ai-threshold'),
@@ -496,138 +499,99 @@ function scheduleDailyRefresh(delayMs = 1500) {
 async function loadDailyStats() {
     if (!cfg.authEmail) return;
     if (_dailyLoadInflight) return _dailyLoadInflight;
-    const url = `${API_BASE_URL.replace(/\/+$/, '')}/push-history?email=${encodeURIComponent(cfg.authEmail)}&days=14`;
+    // Today-only endpoint. Combines server-truth ops count + extension session
+    // stats (captures, linkedinSkipped, role-miss) into one payload so we
+    // don't need /push-history's 14-day history any more.
+    const url = `${API_BASE_URL.replace(/\/+$/, '')}/extension/today-stats?clientEmail=${encodeURIComponent(cfg.authEmail)}`;
     _dailyLoadInflight = (async () => {
         let res;
         try {
             res = await fetch(url);
         } catch (e) {
-            console.warn('[FF-JRD] push-history fetch threw', e?.message);
+            console.warn('[FF-JRD] today-stats fetch threw', e?.message);
             return;
         }
         let body = null;
         try { body = await res.json(); } catch {}
         if (!res.ok || !body?.success) {
-            console.warn('[FF-JRD] push-history non-ok', res.status, body);
+            console.warn('[FF-JRD] today-stats non-ok', res.status, body);
             return;
         }
-        renderDailyStats(body);
+        renderTodayStats(body);
     })();
     try { await _dailyLoadInflight; }
     finally { _dailyLoadInflight = null; }
 }
 
-function renderDailyStats(history) {
-    const days = Array.isArray(history?.history) ? history.history : [];
-    // effectiveCap is server's authoritative cap (admin-set OR default 30).
-    // targetJobCount stays separate so we can label "default" vs explicit.
-    const ci = history?.capInfo || {};
-    const explicitCap = Number.isFinite(Number(ci.targetJobCount)) ? ci.targetJobCount : null;
-    const cap = Number.isFinite(Number(ci.effectiveCap)) ? ci.effectiveCap : explicitCap;
-    const isDefault = ci.isDefaultCap === true;
-    const remaining = Number.isFinite(Number(ci.remaining)) ? ci.remaining : null;
-    const totalOps = history?.totals?.ops || 0;
+// renderTodayStats: paints the four today-only tiles (Scraped / Pushed /
+// LinkedIn skip / Role-miss) + cap progress bar. No history bars. Source:
+// /extension/today-stats — combines ExtensionSessionStat (today) + JobModel
+// ops count (today) + ProfileModel.targetJobCount.
+function renderTodayStats(payload) {
+    const t = payload?.today || {};
+    const pushed = Number(payload?.pushed || 0);
+    const cap = Number(payload?.cap || 0);
+    const isDefault = payload?.isDefaultCap === true;
+    const remaining = Number.isFinite(Number(payload?.remaining))
+        ? payload.remaining
+        : Math.max(0, cap - pushed);
 
-    // Server is source of truth for the cap. If remaining hit 0 mirror that
-    // into local capHit + repaint banner — defensive in case the SW missed
-    // the TARGET_REACHED reply (eviction race). Conversely, if dashboard
-    // raised the cap we clear the local flag so Start re-enables.
-    if (cap != null && Number.isFinite(remaining)) {
-        capInfoCache = {
-            targetJobCount: explicitCap,
-            effectiveCap: cap,
-            isDefaultCap: isDefault,
-            currentOps: ci.currentOps ?? totalOps,
-            remaining,
-        };
-        const shouldHit = remaining <= 0;
-        if (shouldHit !== capHit) {
-            capHit = shouldHit;
-            renderCapHitBanner();
-            applyState();
-        }
+    // Cap-gate sync — keep capHit + banner in step with server truth.
+    capInfoCache = {
+        targetJobCount: isDefault ? null : cap,
+        effectiveCap: cap,
+        isDefaultCap: isDefault,
+        currentOps: pushed,
+        remaining,
+    };
+    const shouldHit = cap > 0 && remaining <= 0;
+    if (shouldHit !== capHit) {
+        capHit = shouldHit;
+        renderCapHitBanner();
+        applyState();
     }
 
-    // Mirror cap into the per-client stats tile so the operator never has
-    // to look in two places. Cap always shows now (default 30 when admin
-    // hasn't set one), so the tile is always visible.
+    // Per-client stats tile (sidebar) mirrors cap progress.
     if (els.clientCapStat) {
-        if (cap == null) {
-            els.clientCapStat.style.display = 'none';
-        } else {
-            els.clientCapStat.style.display = '';
-            const rem = remaining == null ? Math.max(0, cap - totalOps) : remaining;
-            if (els.capRemaining) els.capRemaining.textContent = String(rem);
-            if (els.capTotal) els.capTotal.textContent = isDefault ? `of ${cap} (default)` : `of ${cap}`;
-            els.clientCapStat.classList.toggle('over', rem <= 0);
-            els.clientCapStat.classList.toggle('warn', rem > 0 && (rem / cap) <= 0.2);
-        }
+        els.clientCapStat.style.display = '';
+        if (els.capRemaining) els.capRemaining.textContent = String(remaining);
+        if (els.capTotal) els.capTotal.textContent = isDefault ? `of ${cap} (default)` : `of ${cap}`;
+        els.clientCapStat.classList.toggle('over', remaining <= 0);
+        els.clientCapStat.classList.toggle('warn', remaining > 0 && (remaining / Math.max(cap, 1)) <= 0.2);
     }
 
-    // Densify last 14 days so missing rows render as empty bars.
-    const today = new Date();
-    const dense = [];
-    const requested = Math.max(1, Number(history?.days) || 14);
-    for (let i = requested - 1; i >= 0; i -= 1) {
-        const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - i);
-        const key = d.toISOString().slice(0, 10);
-        const found = days.find((r) => r.date === key);
-        dense.push({ date: key, ops: found?.ops || 0 });
-    }
-    const todayKey = today.toISOString().slice(0, 10);
-    const todayRow = dense.find((r) => r.date === todayKey) || { ops: 0 };
-    const todayOps = todayRow.ops || 0;
+    // Four today tiles.
+    const set = (id, val) => { const el = $(id); if (el) el.textContent = String(val); };
+    set('today-captures', t.captures || 0);
+    set('today-pushed',   pushed);
+    set('today-linkedin', t.linkedinSkipped || 0);
+    set('today-rolemiss', t.roleMismatch || 0);
 
-    if (els.dailyCount) els.dailyCount.textContent = String(todayOps);
-
-    // Cap context line: "· cap N" or "· cap N (default)" — short + readable.
-    if (els.dailyCap) {
-        if (cap == null) {
-            els.dailyCap.textContent = '';
-        } else {
-            els.dailyCap.textContent = isDefault ? `· cap ${cap} (default)` : `· cap ${cap}`;
-        }
+    // Pushed tile sub-text shows cap.
+    const subEl = $('today-cap');
+    if (subEl) subEl.textContent = isDefault ? `of ${cap} (default)` : `of ${cap}`;
+    const pushedTile = subEl?.parentElement;
+    if (pushedTile) {
+        pushedTile.classList.toggle('over', remaining <= 0);
+        pushedTile.classList.toggle('warn', remaining > 0 && remaining <= 5);
     }
+
+    // Sub-line: just "resets at 00:00 IST" + ext session count.
     if (els.dailySub) {
-        const capStr = isDefault ? `${cap} (default)` : `${cap}`;
-        if (cap == null) {
-            els.dailySub.textContent = `${totalOps} total · 14d`;
-        } else if (remaining == null || remaining <= 0) {
-            els.dailySub.textContent = `Cap reached — ${totalOps} of ${capStr}`;
-        } else {
-            els.dailySub.textContent = `${totalOps}/${capStr} total · ${remaining} remaining`;
-        }
+        const sess = t.sessions || 0;
+        els.dailySub.textContent = sess > 0
+            ? `${sess} session${sess === 1 ? '' : 's'} · resets 00:00 IST`
+            : 'resets at 00:00 IST';
     }
 
-    // Cap progress bar (overall, not just today) — gives operator a
-    // glanceable "how close are we to the wall" signal.
+    // Cap progress bar — pushed/cap.
     if (els.dailyFill) {
-        let pct = 0;
-        let cls = '';
-        if (cap != null && cap > 0) {
-            pct = Math.min(100, Math.round((totalOps / cap) * 100));
-            if (totalOps >= cap) cls = 'over';
-            else if (pct >= 80) cls = 'warn';
-        } else {
-            // No cap → show today as fraction of busiest day in the window.
-            const max = dense.reduce((m, r) => (r.ops > m ? r.ops : m), 0);
-            pct = max > 0 ? Math.round((todayOps / max) * 100) : 0;
-        }
+        const pct = cap > 0 ? Math.min(100, Math.round((pushed / cap) * 100)) : 0;
         els.dailyFill.style.width = `${pct}%`;
+        let cls = '';
+        if (pushed >= cap) cls = 'over';
+        else if (pct >= 80) cls = 'warn';
         els.dailyFill.className = `daily-fill ${cls}`.trim();
-    }
-
-    // Sparkline. Empty days get a faint slot so the row stays visually
-    // anchored. Today is highlighted regardless of count.
-    if (els.dailySpark) {
-        const max = dense.reduce((m, r) => (r.ops > m ? r.ops : m), 0) || 1;
-        els.dailySpark.innerHTML = dense.map((r) => {
-            const heightPct = r.ops > 0 ? Math.max(8, Math.round((r.ops / max) * 100)) : 6;
-            const isToday = r.date === todayKey;
-            const empty = r.ops === 0 && !isToday;
-            const cls = `bar${isToday ? ' today' : ''}${empty ? ' empty' : ''}`;
-            return `<div class="${cls}" style="height:${heightPct}%" title="${escapeHtml(r.date)} · ${r.ops} job${r.ops === 1 ? '' : 's'}"></div>`;
-        }).join('');
     }
 }
 
@@ -721,11 +685,20 @@ function applyState() {
     // In auto-mode the Judge button becomes a "flush remaining" trigger;
     // it stays enabled whenever capture is active (no isJudged gate).
     if (cfg.autoMode !== false) {
-        els.judge.textContent = 'Stop scraping & push';
-        els.judge.title = 'Stops capture, drains anything pending through judge → resolve → push.';
-        // Stay enabled whenever there's something captured (even if capture stopped
-        // because of cap-hit or manual stop) so operator can still flush remainder.
-        els.judge.disabled = captureCount === 0 || isProcessing;
+        if (isProcessing) {
+            els.judge.textContent = 'Pushing…';
+            els.judge.title = 'Pipeline draining — judge → resolve → push.';
+            els.judge.disabled = true;
+        } else {
+            els.judge.textContent = captureCount > 0
+                ? `Stop scraping & push (${captureCount})`
+                : 'Stop scraping & push';
+            els.judge.title = 'Stops capture, drains pending through judge → resolve → push, then re-arms Start.';
+            // Stay enabled whenever there's something captured (even after cap-hit
+            // or manual stop) so operator can still flush remainder. After flush
+            // completes runJudge clears the buffer → button auto-disables.
+            els.judge.disabled = captureCount === 0 || isProcessing;
+        }
     } else {
         els.judge.textContent = 'Judge captured';
         els.judge.title = '';
@@ -1138,11 +1111,13 @@ async function doLogout() {
     cfg.extensionCode = ''; cfg.operatorName = '';
     captureCount = 0; linkedinSkippedCount = 0; captureActive = false; isJudged = false;
     decisionsMap.clear();
-    if (els.dailyCount) els.dailyCount.textContent = '0';
-    if (els.dailySub) els.dailySub.textContent = '—';
-    if (els.dailyFill) els.dailyFill.style.width = '0%';
-    if (els.dailySpark) els.dailySpark.innerHTML = '';
-    if (els.dailyCap) els.dailyCap.textContent = '';
+    if (els.todayCaptures) els.todayCaptures.textContent = '0';
+    if (els.todayPushed)   els.todayPushed.textContent   = '0';
+    if (els.todayLinkedin) els.todayLinkedin.textContent = '0';
+    if (els.todayRolemiss) els.todayRolemiss.textContent = '0';
+    if (els.todayCap)      els.todayCap.textContent      = '';
+    if (els.dailySub)      els.dailySub.textContent      = 'resets at 00:00 IST';
+    if (els.dailyFill)     els.dailyFill.style.width     = '0%';
     if (els.clientCapStat) els.clientCapStat.style.display = 'none';
     if (els.liveBar) els.liveBar.hidden = true;
     resetLiveCounts();
@@ -1169,6 +1144,12 @@ async function saveConfig() {
 // read-only here. Build/edit happens at /ai-summaries on that portal.
 
 async function startCapture() {
+    // Wipe any stale capture buffer + decisions from the previous session
+    // so captureCount starts at 0 and the side panel is clean. Cheap if
+    // already empty.
+    if (captureCount > 0) {
+        await send('jrd-clear-capture').catch(() => {});
+    }
     decisionsMap.clear();
     rebuildList();
     els.outcomesRow.hidden = true;
@@ -1179,7 +1160,10 @@ async function startCapture() {
     els.pushedCount.textContent = '0';
     els.picksCount.textContent = '0';
     linkedinSkippedCount = 0;
+    captureCount = 0;
     isJudged = false;
+    if (els.count) els.count.textContent = '0';
+    if (els.linkedinSkippedCount) els.linkedinSkippedCount.textContent = '0';
     resetLiveCounts();
     const r = await send('jrd-start-capture');
     if (r?.ok) {
@@ -1193,24 +1177,59 @@ async function startCapture() {
 
 async function runJudge() {
     // In auto-mode, the SW pipelines judge → resolve → push as the operator
-    // scrolls. Manual click here just drains anything not yet auto-batched.
+    // scrolls. Manual click here drains anything not yet auto-batched, halts
+    // capture, then resets the buffer so Start is armed for a fresh session.
     if (cfg.autoMode !== false) {
-        setProcessing(true, '<span class="step">Auto-flush</span> — draining remaining captures through pipeline…');
-        setMessage('Auto pipeline running — flushing remaining jobs (judge + scrape + push)…');
+        // 1. Halt fresh ingest first so no new captures land mid-flush. SW
+        //    leaves the buffer intact for the auto-pipeline to drain.
+        await send('jrd-stop-capture').catch(() => {});
+        captureActive = false;
+
+        // 2. Live feedback while the pipeline drains.
+        setProcessing(true, '<span class="step">Stop & push</span> — draining pipeline…');
+        const draining = captureCount > 0
+            ? `Stopping capture · pushing remaining ${captureCount} captured jobs through judge → resolve → push…`
+            : 'Stopping capture · finishing in-flight pushes…';
+        setMessage(draining);
+        setLive('Stopping', `Pushing ${captureCount} jobs — judge → resolve → push…`);
         applyState();
+
         const r = await send('jrd-flush-auto');
-        setProcessing(false);
         if (!r?.ok) {
-            setMessage(`Auto-flush failed: ${r?.error || 'UNEXPECTED'} ${r?.message || ''}`, 'error');
+            setProcessing(false);
+            setMessage(`Stop & push failed: ${r?.error || 'UNEXPECTED'} ${r?.message || ''}`, 'error');
+            applyState();
             return;
         }
         const s = r.stats || {};
-        setMessage(
-            `Auto totals — judged ${s.judged || 0} · picks ${s.picks || 0} · pushed ${s.pushed || 0} · dupes ${s.dupes || 0} · blocked ${s.blocked || 0} · errors ${s.errors || 0}`,
-            'ok',
-        );
-        pushTickerLine(`✓ auto flush — pushed ${s.pushed || 0} / picks ${s.picks || 0}`);
-        applyState();
+
+        // 3. Show summary — bold + green so operator can't miss it.
+        const totalsLine = `judged ${s.judged || 0} · picks ${s.picks || 0} · pushed ${s.pushed || 0} · dupes ${s.dupes || 0} · blocked ${s.blocked || 0} · errors ${s.errors || 0}`;
+        setMessage(`✓ Done — ${totalsLine}. Buffer cleared, ready to capture again.`, 'ok');
+        pushTickerLine(`✓ flushed — pushed ${s.pushed || 0} / picks ${s.picks || 0}`);
+        setLive('Done', `Pushed ${s.pushed || 0} of ${s.picks || 0} picks. Click Start to scrape more.`, 'success');
+
+        // 4. Auto-clear capture buffer so captureCount=0 and Start re-arms.
+        //    Wait for the SW to settle so the response carries fresh state.
+        await send('jrd-clear-capture').catch(() => {});
+        captureCount = 0;
+        captureActive = false;
+        linkedinSkippedCount = 0;
+        if (els.count) els.count.textContent = '0';
+        if (els.linkedinSkippedCount) els.linkedinSkippedCount.textContent = '0';
+
+        // 5. Re-pull state from SW — covers any remaining flags and ensures
+        //    the Start button condition (!captureActive && !isProcessing &&
+        //    !capHit) actually becomes true.
+        setProcessing(false);
+        await refreshState().catch(() => {});
+
+        // 6. Visual nudge — flash Start button green so operator sees it's
+        //    armed. CSS `start-armed` is removed after 1.6s.
+        if (els.start && !els.start.disabled) {
+            els.start.classList.add('start-armed');
+            setTimeout(() => els.start?.classList.remove('start-armed'), 1600);
+        }
         return;
     }
     // Manual fallback (autoMode disabled).
@@ -1350,10 +1369,14 @@ chrome.runtime.onMessage.addListener((msg) => {
             if (msg.phase === 'cap-reached') {
                 captureActive = false;
                 applyState();
-                setMessage(`Capture cap reached (${msg.cap || CAPTURE_CAP}). Auto-stopped — pipeline will finish remaining picks.`, 'warn');
-                pushTickerLine(`⚑ cap reached — capture auto-stopped`, 'batch');
-                setLive('Cap reached', `${msg.cap || CAPTURE_CAP} captures — auto-stopping new ingest. Pipeline still draining…`, 'success');
-                hideLive(4500);
+                setMessage(`Buffer full (${msg.cap || CAPTURE_CAP} captures). Capture auto-stopped — click "Stop scraping & push" to flush + reset.`, 'warn');
+                pushTickerLine(`⚑ buffer full — click Stop & push to flush`, 'batch');
+                setLive('Buffer full', `Click Stop & push (${captureCount}) to drain pipeline + re-arm Start.`, 'success');
+                // Highlight the flush button so operator's eye is drawn there.
+                if (els.judge && !els.judge.disabled) {
+                    els.judge.classList.add('start-armed');
+                    setTimeout(() => els.judge?.classList.remove('start-armed'), 2400);
+                }
             }
             if (msg.phase === 'cap-hit') {
                 // Server-side client cap (targetJobCount) reached. Hard halt:
@@ -1605,3 +1628,16 @@ function toggleShortcutHelp(force) {
 
 // Boot
 refreshState();
+
+// Today tile manual refresh + 20s auto-refresh while main view is open.
+if (els.todayRefresh) {
+    els.todayRefresh.addEventListener('click', () => {
+        els.todayRefresh.classList.add('spin');
+        loadDailyStats().finally(() => setTimeout(() => els.todayRefresh.classList.remove('spin'), 400));
+    });
+}
+setInterval(() => {
+    if (els.mainView?.hidden) return;
+    if (!cfg.authEmail) return;
+    loadDailyStats().catch(() => {});
+}, 20000);

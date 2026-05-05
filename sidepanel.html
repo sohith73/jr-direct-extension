@@ -141,8 +141,10 @@
         <div class="live-counts" id="live-counts"></div>
     </section>
 
-    <!-- DAILY PROGRESS CARD — server-truth from /push-history?days=14 -->
-    <section class="row daily-card" id="daily-card">
+    <!-- TODAY CARD — pulls today-only stats from /extension/today-stats.
+         No history bars, no yesterday data. Refreshes every 20s + after
+         every flush. -->
+    <section class="row daily-card today-card" id="daily-card">
         <div class="daily-head">
             <div class="daily-title-block">
                 <span class="daily-icon" aria-hidden="true">
@@ -154,20 +156,33 @@
                     </svg>
                 </span>
                 <div>
-                    <div class="daily-label">Added today</div>
-                    <div class="daily-sub" id="daily-sub">—</div>
+                    <div class="daily-label">Today</div>
+                    <div class="daily-sub" id="daily-sub">resets at 00:00 IST</div>
                 </div>
             </div>
-            <div class="daily-value">
-                <span id="daily-count" class="daily-num">0</span>
-                <span class="daily-cap" id="daily-cap"></span>
+            <button type="button" id="today-refresh" class="ghost icon" title="Refresh today's stats" aria-label="Refresh">↻</button>
+        </div>
+        <div class="today-grid">
+            <div class="today-tile" title="Job cards captured by scrolling JR — extension session totals.">
+                <div class="today-tile-label">Scraped</div>
+                <div class="today-tile-num" id="today-captures">0</div>
+            </div>
+            <div class="today-tile pushed" title="Operator-pushed jobs landed in this client's tracker today (server-truth).">
+                <div class="today-tile-label">Pushed</div>
+                <div class="today-tile-num" id="today-pushed">0</div>
+                <div class="today-tile-sub" id="today-cap">of 30</div>
+            </div>
+            <div class="today-tile linkedin" title="LinkedIn-only postings auto-skipped per push policy.">
+                <div class="today-tile-label">LinkedIn skip</div>
+                <div class="today-tile-num" id="today-linkedin">0</div>
+            </div>
+            <div class="today-tile rolemiss" title="AI rejected because title doesn't match preferred roles.">
+                <div class="today-tile-label">Role-miss</div>
+                <div class="today-tile-num" id="today-rolemiss">0</div>
             </div>
         </div>
         <div class="daily-progress">
             <div class="daily-fill" id="daily-fill"></div>
-        </div>
-        <div class="daily-spark" id="daily-spark" aria-label="Last 14 days">
-            <!-- 14 day bars injected by sidepanel.js -->
         </div>
     </section>
 

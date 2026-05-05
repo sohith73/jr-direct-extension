@@ -62,7 +62,7 @@ const state = {
         processed: new Set(),
         profile: null,
         aiSummary: '',
-        stats: { judged: 0, picks: 0, pushed: 0, dupes: 0, blocked: 0, errors: 0 },
+        stats: { judged: 0, picks: 0, pushed: 0, dupes: 0, blocked: 0, errors: 0, skipsByKind: {} },
         // Hard stop. Flips true on first server TARGET_REACHED reply OR
         // when /push-history reports remaining=0. While true the SW refuses
         // to fire new batches, refuses individual pushes, and auto-stops
@@ -1050,7 +1050,9 @@ the skip border so the operator can scan failures at a glance.
 ROLE MATCHING (THE MOST IMPORTANT RULE — read carefully):
 
 The candidate's preferredRoles list is the WHOLE universe of acceptable
-disciplines. Do NOT invent role groupings. Do NOT widen the family.
+disciplines. Do NOT invent unrelated role groupings. Do NOT widen the
+family across disciplines (e.g. don't pick "Inventory Control Analyst"
+when the candidate wants "Data Analyst" — those are different fields).
 
 Step 1 — Extract the discipline QUALIFIER from each preferredRole.
   "Data Analyst"                  → qualifier "Data"
@@ -1063,43 +1065,78 @@ Step 1 — Extract the discipline QUALIFIER from each preferredRole.
 The bare role noun ("Analyst", "Engineer", "Manager", "Specialist",
 "Developer") is NEVER a qualifier on its own.
 
-Step 2 — Look at the JOB TITLE. Pick ONLY when the title contains a
-qualifier that lines up with one of the candidate's qualifiers (case-
-insensitive, allow obvious abbreviations: BI ↔ Business Intelligence,
-ML ↔ Machine Learning, FE ↔ Frontend, BE ↔ Backend).
+Step 2 — Look at the JOB TITLE. Pick when the title contains EITHER:
+  (a) a direct qualifier match from the candidate's list (case-insensitive,
+      allow obvious abbreviations: BI ↔ Business Intelligence,
+      ML ↔ Machine Learning, FE ↔ Frontend, BE ↔ Backend), OR
+  (b) an ADJACENT qualifier in the SAME field — accept when there is
+      strong domain overlap. Allowed adjacencies (only these — do not
+      invent more):
+        Data ↔ Analytics ↔ Reporting ↔ Insights
+        BI / Business Intelligence ↔ Reporting ↔ Analytics
+        Financial ↔ Finance ↔ FP&A ↔ Treasury (only when JD is finance work)
+        Software / Backend / Frontend / Full-Stack ↔ Developer / SWE / SDE
+            (only swap WITHIN this engineering family if at least one of
+             those qualifiers is in preferredRoles)
+        Product Manager ↔ Product Owner ↔ APM
+        ML ↔ AI ↔ Machine Learning Engineer ↔ Applied Scientist
+            (only when at least one ML/AI qualifier is in preferredRoles)
+      Adjacent matches REQUIRE the JD body to confirm the work is in
+      that field. If the JD body talks about something different (e.g.
+      "Analytics Engineer" but JD is product analytics for a sales team
+      while candidate wants pipeline data engineering), still skip.
 
-Step 3 — When in doubt, SKIP with skipKind:"role-mismatch". Operator
-prefers fewer high-quality picks over more loose ones.
+Step 3 — When still in doubt after Step 2, SKIP with
+skipKind:"role-mismatch". A clean skip is better than a wrong push.
+NEVER allow a cross-field match: Sourcing, Inventory Control,
+Procurement, Sales, Marketing, Operations Coordinator, Customer Success,
+QA (unless QA is in preferredRoles), Recruiting, etc. — none of these
+are "adjacent" to Data/Finance/Engineering disciplines.
 
 Examples for preferredRoles = [Data Analyst, Data Engineer, Financial
 Analyst, Business Analyst, Business Intelligence Engineer]:
   "Data Analyst, Senior"          → PICK · matchedRole "Data Analyst"
-  "Senior BI Analyst"             → PICK · matchedRole "Business Intelligence Engineer" (BI qualifier matches)
-  "Reporting Analyst (BI)"        → PICK if JD body confirms BI work · matchedRole "Business Intelligence Engineer"
+  "Senior BI Analyst"             → PICK · matchedRole "Business Intelligence Engineer" (BI matches)
+  "Reporting Analyst"             → PICK (adjacent: Reporting ↔ BI) · matchedRole "Business Intelligence Engineer"
+  "Analytics Engineer"            → PICK (adjacent: Analytics ↔ Data) · matchedRole "Data Engineer"
+  "Finance Analyst, FP&A"         → PICK (adjacent: Finance ↔ Financial) · matchedRole "Financial Analyst"
   "Financial Planning Analyst"    → PICK · matchedRole "Financial Analyst"
-  "Analyst I"                     → SKIP role-mismatch — title carries no qualifier, generic
-  "Category Sourcing Analyst"     → SKIP role-mismatch — Sourcing qualifier not in candidate list
-  "Inventory Control Analyst"     → SKIP role-mismatch — Inventory Control qualifier not in candidate list
-  "Inventory Control Specialist"  → SKIP role-mismatch — same as above
-  "GenAI Python Systems Engineer" → SKIP role-mismatch — Systems Engineering ≠ Data Engineering
-  "Software Engineer (Frontend)"  → SKIP role-mismatch — Frontend qualifier absent from candidate list
-  "Quantitative Analyst"          → SKIP role-mismatch — Quant ≠ Financial Analyst (different discipline)
+  "Insights Analyst"              → PICK if JD = data/analytics work · matchedRole "Data Analyst"
+  "Analyst I"                     → SKIP role-mismatch — generic, no field qualifier
+  "Category Sourcing Analyst"     → SKIP — Sourcing is procurement, not data/finance
+  "Inventory Control Analyst"     → SKIP — different field
+  "GenAI Python Systems Engineer" → SKIP — Systems Engineering ≠ Data Engineering
+  "Quantitative Analyst"          → SKIP — Quant trading ≠ Financial Analyst
 
 Scoring rules:
-- score 0-100 weighing: role qualifier match (50%), seniority (20%),
-  location/work-model (15%), skills/JD signals (10%), salary (5%).
+- score 0-100 weighing: role qualifier match (45%), seniority (20%),
+  location/work-model (15%), skills/JD signals (15%), salary (5%).
 - BEFORE any pick logic: excludedRoles veto. If title contains an
   excludedRole token (case-insensitive substring), force pick=false
   with skipKind="role-mismatch" — no exceptions.
-- BEFORE any pick logic: if no preferredRole qualifier matches the title
-  (Step 2 above), force pick=false. Do not invent partial matches.
-- Pick only when (a) qualifier matches AND (b) score >= operator threshold
-  passed in the user prompt AND (c) seniority within 2 levels of
-  candidate's experienceLevel.
-- Skip when seniority is 3+ levels off (intern asked → VP; senior → entry).
-- Do NOT lump "Data" with "Software Engineer / Backend / SRE / DevOps /
-  Mobile / Security / QA" unless those exact qualifiers appear in
-  preferredRoles. Each discipline is its own family.
+- BEFORE any pick logic: if no direct OR adjacent qualifier matches
+  the title (Step 2), force pick=false.
+- Pick only when (a) qualifier matches (direct or adjacent in same field)
+  AND (b) score >= operator threshold AND (c) seniority within band.
+
+Seniority bands (use experienceLevel from hard signals):
+- intern         → 0 yrs                  · pick when JD says intern
+- entry          → 0-3 yrs (INCLUDES 1, 2 yrs job postings — those ARE entry)
+- mid            → 2-6 yrs
+- senior         → 5-10 yrs (and "Sr", "II", "III" titles)
+- lead/staff     → 7-12 yrs
+- principal      → 10-15 yrs
+- director / VP  → 12+ yrs management
+- exec           → 15+ yrs
+
+Seniority skip rules:
+- entry candidate vs JD demanding "1+ years", "2+ years", "1-3 years"
+  → PICK. These are entry-level postings. Only SKIP when JD demands
+  4+ years OR a senior-tier title (Sr / Lead / Staff / Principal / Director).
+- mid candidate vs JD demanding 0-1 yrs (intern) → SKIP.
+- mid candidate vs JD demanding 7+ yrs → SKIP.
+- Skip only when bands are 2+ apart (entry vs senior, mid vs director).
+  Adjacent bands (entry↔mid, mid↔senior) → still pick.
 
 REASON QUALITY — every reason MUST be ONE short sentence, 90-160 chars,
 plain English, no fluff. Pattern:
@@ -1319,18 +1356,225 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
     // qualifier (case-insensitive substring). Conservative: false negatives
     // are cheaper than wrong jobs landing in the client's tracker.
     const ROLE_NOUN_STRIP = /\b(?:engineer|developer|analyst|manager|specialist|consultant|associate|architect|administrator|lead|director|vp|officer|technician|scientist|coordinator|executive|advisor|representative|operator|owner|head|chief|principal|senior|sr|jr|junior|staff|intern)\b/gi;
-    // Common abbreviations operators expect us to honor.
+    // Direct abbreviations + adjacent same-field qualifiers. Adjacent ones
+    // expand the qualifier set so a "Reporting Analyst" title still passes
+    // the deterministic veto when the candidate wants "BI Engineer". The
+    // model-side prompt enforces "JD body must confirm" for adjacents — the
+    // veto only refuses when ZERO tokens (direct OR adjacent) hit the title.
+    // Production qualifier map — direct abbreviations + adjacent same-field
+    // synonyms grouped by discipline. Bidirectional within a group: every
+    // entry pulls in its peers, and lookups via expandQualifier() walk the
+    // map in reverse so abbreviations also resolve to their long form. Any
+    // adjacency added here MUST stay within the same field — cross-field
+    // lumps (e.g. "data" ↔ "sales") are exactly the bug we're guarding
+    // against, not features.
     const ABBREV_MAP = {
-        'business intelligence': ['bi'],
-        'machine learning': ['ml'],
-        'artificial intelligence': ['ai'],
-        'frontend': ['fe', 'front end', 'front-end'],
-        'backend': ['be', 'back end', 'back-end'],
-        'quality assurance': ['qa'],
-        'site reliability': ['sre'],
-        'devops': ['dev ops', 'dev-ops'],
-        'product manager': ['pm'],
-        'project manager': ['pm'],
+        // -------- Data / Analytics / BI / ML / AI ----------------------
+        'data':                    ['analytics', 'reporting', 'insights', 'big data'],
+        'analytics':               ['data', 'reporting', 'insights', 'bi', 'business intelligence'],
+        'reporting':               ['bi', 'business intelligence', 'analytics', 'data'],
+        'insights':                ['data', 'analytics', 'reporting'],
+        'business intelligence':   ['bi', 'reporting', 'analytics', 'data'],
+        'bi':                      ['business intelligence', 'reporting', 'analytics', 'data'],
+        'machine learning':        ['ml', 'ai', 'artificial intelligence', 'applied scientist', 'deep learning'],
+        'ml':                      ['machine learning', 'ai', 'deep learning', 'applied scientist'],
+        'artificial intelligence': ['ai', 'ml', 'machine learning', 'genai', 'llm'],
+        'ai':                      ['ml', 'machine learning', 'artificial intelligence', 'genai', 'llm'],
+        'genai':                   ['ai', 'llm', 'generative', 'machine learning'],
+        'llm':                     ['ai', 'genai', 'machine learning'],
+        'data scientist':          ['data science', 'applied scientist', 'research scientist'],
+        'data science':            ['data scientist', 'applied scientist', 'machine learning'],
+        'data engineer':           ['data engineering', 'analytics engineer', 'pipeline'],
+        'data engineering':        ['data engineer', 'analytics engineer', 'etl'],
+        'etl':                     ['data engineering', 'pipeline', 'integration'],
+        'statistician':            ['statistics', 'biostatistics', 'quantitative'],
+
+        // -------- Software / Web / Mobile / Platform -------------------
+        // NOTE: never expand to bare 'engineer' — too generic, would let
+        // every "X Engineer" title pass for a "Software Engineer" candidate.
+        // Software-discipline expansion intentionally pulls in the common
+        // flavors so a generic "Software Engineer" candidate accepts FE/BE/
+        // mobile/platform titles. The reverse adjacency (FE candidate matching
+        // SE titles) is also fine — most "Software Engineer" jobs cover FE.
+        'software':                ['developer', 'swe', 'sde', 'programmer', 'frontend', 'backend', 'full stack', 'fullstack'],
+        'developer':               ['software', 'swe', 'sde', 'programmer'],
+        'swe':                     ['software', 'developer', 'sde'],
+        'sde':                     ['software', 'developer', 'swe'],
+        'frontend':                ['fe', 'front end', 'front-end', 'web', 'ui', 'react', 'angular', 'vue'],
+        'fe':                      ['frontend', 'front end', 'front-end', 'ui'],
+        'backend':                 ['be', 'back end', 'back-end', 'server', 'api', 'platform'],
+        'be':                      ['backend', 'back end', 'back-end', 'server'],
+        'full stack':              ['fullstack', 'full-stack', 'fs'],
+        'fullstack':               ['full stack', 'full-stack', 'fs'],
+        'mobile':                  ['ios', 'android', 'native', 'react native', 'flutter'],
+        'ios':                     ['mobile', 'swift', 'native'],
+        'android':                 ['mobile', 'kotlin', 'native'],
+        'embedded':                ['firmware', 'iot', 'systems', 'hardware'],
+        'firmware':                ['embedded', 'iot', 'low-level'],
+        'platform':                ['infrastructure', 'devops', 'sre', 'cloud'],
+        'infrastructure':          ['infra', 'platform', 'devops', 'sre', 'cloud'],
+        'cloud':                   ['aws', 'azure', 'gcp', 'devops', 'platform', 'infrastructure'],
+        'aws':                     ['cloud', 'amazon web services'],
+        'azure':                   ['cloud', 'microsoft cloud'],
+        'gcp':                     ['cloud', 'google cloud'],
+        'devops':                  ['dev ops', 'dev-ops', 'sre', 'platform', 'infrastructure', 'ci/cd'],
+        'site reliability':        ['sre', 'devops', 'platform', 'infrastructure'],
+        'sre':                     ['site reliability', 'devops', 'platform'],
+        'security':                ['cybersecurity', 'cyber', 'infosec', 'application security', 'appsec'],
+        'cybersecurity':           ['security', 'cyber', 'infosec'],
+        'infosec':                 ['security', 'cybersecurity', 'cyber'],
+        'appsec':                  ['security', 'application security'],
+        'blockchain':              ['web3', 'crypto', 'smart contract', 'solidity'],
+        'quality assurance':       ['qa', 'sdet', 'test', 'testing', 'automation'],
+        'qa':                      ['quality assurance', 'sdet', 'test', 'testing'],
+        'sdet':                    ['qa', 'test', 'automation', 'quality assurance'],
+
+        // -------- Product / Program / Project --------------------------
+        'product manager':         ['pm', 'product owner', 'apm', 'product lead'],
+        'product owner':           ['pm', 'product manager', 'po'],
+        'apm':                     ['associate product manager', 'product manager', 'pm'],
+        'product':                 ['pm', 'apm', 'product owner', 'po'],
+        'project manager':         ['pm', 'program manager', 'pmp'],
+        'program manager':         ['program', 'tpm', 'project manager'],
+        'tpm':                     ['technical program manager', 'program manager'],
+        'scrum master':            ['agile', 'scrum', 'product owner'],
+        'business analyst':        ['ba', 'systems analyst', 'requirements analyst'],
+
+        // -------- Design / UX / UI / Creative --------------------------
+        'ux':                      ['user experience', 'product design', 'design'],
+        'ui':                      ['user interface', 'product design', 'visual design', 'frontend'],
+        'user experience':         ['ux', 'product design', 'interaction design'],
+        'product design':          ['ux', 'ui', 'design', 'visual design'],
+        'visual design':           ['ui', 'graphic design', 'product design'],
+        'graphic design':          ['visual design', 'creative', 'brand'],
+        'interaction design':      ['ux', 'ixd', 'product design'],
+        'design':                  ['ux', 'ui', 'product design', 'visual design'],
+        'ux research':             ['user research', 'design research', 'research'],
+        'user research':           ['ux research', 'research', 'design research'],
+
+        // -------- Finance / Accounting --------------------------------
+        'financial':               ['finance', 'fp&a', 'fpa', 'treasury', 'accounting'],
+        'finance':                 ['financial', 'fp&a', 'fpa', 'treasury', 'accounting'],
+        'fp&a':                    ['financial planning', 'finance', 'financial', 'fpa'],
+        'fpa':                     ['fp&a', 'financial planning', 'finance', 'financial'],
+        'accounting':              ['accountant', 'controller', 'audit', 'bookkeeping', 'gl', 'tax', 'cpa'],
+        'accountant':              ['accounting', 'controller', 'audit', 'tax', 'cpa', 'bookkeeping'],
+        'controller':              ['accounting', 'finance', 'cfo'],
+        'audit':                   ['auditor', 'accounting', 'compliance', 'internal audit'],
+        'auditor':                 ['audit', 'accounting'],
+        'tax':                     ['taxation', 'accounting', 'audit'],
+        'treasury':                ['finance', 'financial', 'cash management'],
+        'investment':              ['investments', 'investor', 'pe', 'private equity', 'vc'],
+        'investor':                ['investment', 'pe', 'venture'],
+        'private equity':          ['pe', 'investment', 'buyout'],
+        'venture capital':         ['vc', 'investment', 'venture'],
+        'risk':                    ['risk management', 'compliance', 'underwriting'],
+
+        // -------- Sales / Customer Success / Marketing -----------------
+        'sales':                   ['account executive', 'ae', 'business development', 'bd', 'sdr', 'bdr', 'inside sales', 'revenue'],
+        'account executive':       ['ae', 'sales', 'enterprise sales'],
+        'ae':                      ['account executive', 'sales'],
+        'sdr':                     ['sales development', 'bdr', 'inside sales', 'sales'],
+        'bdr':                     ['business development', 'sdr', 'sales development', 'sales'],
+        'business development':    ['bd', 'sdr', 'bdr', 'partnerships', 'sales'],
+        'account manager':         ['account management', 'csm', 'customer success'],
+        'customer success':        ['csm', 'account manager', 'customer experience'],
+        'csm':                     ['customer success manager', 'account manager'],
+        'partnerships':            ['business development', 'bd', 'alliances', 'channel'],
+        'marketing':               ['growth', 'demand gen', 'brand', 'communications', 'comms', 'content', 'seo', 'sem', 'crm', 'lifecycle'],
+        'growth':                  ['marketing', 'growth marketing', 'performance marketing', 'demand gen'],
+        'demand gen':              ['demand generation', 'marketing', 'growth'],
+        'content':                 ['content marketing', 'copywriter', 'editorial', 'marketing'],
+        'seo':                     ['search engine optimization', 'sem', 'search marketing', 'marketing'],
+        'sem':                     ['search engine marketing', 'seo', 'paid search', 'marketing'],
+        'brand':                   ['branding', 'marketing', 'creative'],
+        'communications':          ['comms', 'pr', 'public relations', 'marketing'],
+        'pr':                      ['public relations', 'communications', 'comms'],
+
+        // -------- Operations / Strategy / BizOps -----------------------
+        'operations':              ['ops', 'business ops', 'biz ops', 'strategy ops'],
+        'ops':                     ['operations', 'business operations'],
+        'business operations':     ['biz ops', 'ops', 'strategy ops', 'revenue ops'],
+        'biz ops':                 ['business operations', 'ops', 'strategy'],
+        'revenue operations':      ['revops', 'sales ops', 'ops'],
+        'revops':                  ['revenue operations', 'sales ops'],
+        'sales ops':                ['sales operations', 'revops', 'revenue operations'],
+        'strategy':                ['strategic', 'business strategy', 'corporate strategy'],
+        'chief of staff':          ['cos', 'strategy', 'executive office'],
+        'supply chain':            ['logistics', 'procurement', 'operations'],
+        'logistics':               ['supply chain', 'distribution', 'operations'],
+
+        // -------- HR / Talent / Recruiting / People --------------------
+        'human resources':         ['hr', 'people', 'people ops', 'talent'],
+        'hr':                      ['human resources', 'people', 'people ops'],
+        'people':                  ['hr', 'people ops', 'human resources'],
+        'people operations':       ['people ops', 'hr', 'human resources'],
+        'talent':                  ['recruiting', 'recruiter', 'talent acquisition', 'hr'],
+        'talent acquisition':      ['recruiting', 'recruiter', 'ta'],
+        'recruiting':              ['recruiter', 'talent acquisition', 'sourcer'],
+        'recruiter':               ['recruiting', 'talent acquisition', 'sourcer'],
+        'sourcer':                 ['recruiter', 'recruiting', 'talent'],
+        'l&d':                     ['learning and development', 'training', 'enablement'],
+        'compensation':            ['comp', 'rewards', 'total rewards', 'benefits'],
+
+        // -------- Legal / Compliance / Policy --------------------------
+        'legal':                   ['lawyer', 'attorney', 'counsel', 'paralegal'],
+        'attorney':                ['lawyer', 'counsel', 'legal'],
+        'counsel':                 ['legal', 'attorney', 'lawyer'],
+        'paralegal':               ['legal', 'legal assistant'],
+        'compliance':              ['regulatory', 'risk', 'governance', 'legal'],
+        'regulatory':              ['compliance', 'regulatory affairs', 'governance'],
+        'policy':                  ['public policy', 'government affairs', 'regulatory'],
+
+        // -------- Healthcare / Clinical / Biotech ---------------------
+        'clinical':                ['clinical research', 'cra', 'clinical operations'],
+        'clinical research':       ['clinical', 'cra', 'cro'],
+        'cra':                     ['clinical research associate', 'clinical research'],
+        'medical':                 ['clinical', 'physician', 'healthcare'],
+        'nursing':                 ['nurse', 'rn', 'lpn', 'clinical'],
+        'biomedical':              ['biotech', 'biology', 'medical', 'r&d'],
+        'biotech':                 ['biomedical', 'pharmaceutical', 'pharma'],
+        'pharmaceutical':          ['pharma', 'biotech'],
+        'pharmacology':            ['pharmacist', 'pharmaceutical'],
+        'public health':           ['epidemiology', 'health policy', 'medical'],
+
+        // -------- R&D / Hardware / Mechanical / Civil / Aerospace -----
+        'r&d':                     ['research and development', 'research', 'product development'],
+        'mechanical':              ['mech', 'mechatronics', 'manufacturing'],
+        'electrical':              ['ee', 'electronics', 'circuit', 'power'],
+        'civil':                   ['structural', 'construction', 'infrastructure engineer'],
+        'aerospace':               ['aero', 'aviation', 'space', 'astronautics'],
+        'chemical':                ['chemistry', 'process engineer', 'chem e'],
+        'materials':               ['materials science', 'metallurgy'],
+        'industrial':              ['industrial engineering', 'manufacturing', 'process'],
+        'manufacturing':           ['production', 'industrial', 'mfg'],
+        'quality':                 ['qc', 'quality control', 'qa'],
+        'qc':                      ['quality control', 'quality', 'qa'],
+
+        // -------- Research / Academic ---------------------------------
+        'research':                ['scientist', 'researcher', 'r&d'],
+        'researcher':              ['research', 'scientist', 'analyst'],
+        'scientist':               ['research', 'researcher'],
+        'postdoc':                 ['post doctoral', 'research fellow', 'researcher'],
+
+        // -------- Education / Training --------------------------------
+        'teacher':                 ['educator', 'instructor', 'teaching'],
+        'instructor':              ['teacher', 'trainer', 'educator'],
+        'professor':               ['lecturer', 'faculty', 'academic'],
+        'curriculum':              ['instructional design', 'course developer', 'training'],
+
+        // -------- Customer Support ------------------------------------
+        'customer support':        ['support', 'customer service', 'cs', 'help desk'],
+        'customer service':        ['cs', 'support', 'customer support'],
+        'support':                 ['customer support', 'technical support', 'help desk'],
+        'technical support':       ['tech support', 'support engineer', 'help desk'],
+
+        // -------- Writing / Editorial / Localization ------------------
+        'writer':                  ['copywriter', 'content writer', 'editor', 'editorial'],
+        'editor':                  ['editorial', 'writer', 'copy editor'],
+        'technical writer':        ['tech writer', 'documentation', 'docs'],
+        'localization':            ['l10n', 'translation', 'translator'],
+        'translator':              ['translation', 'localization', 'l10n'],
     };
     function expandQualifier(q) {
         const lower = q.toLowerCase().trim();
@@ -1367,11 +1611,15 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
             .replace(/[()/+,]/g, ' ')
             .replace(/\s{2,}/g, ' ')
             .trim();
-        if (!stripped) continue;
-        for (const v of expandQualifier(stripped)) qualifierTokens.add(v);
+        // Fallback: when the preferredRole is just a role noun ("Accountant",
+        // "Recruiter", "Designer") the strip produces an empty string. Use
+        // the lowercase original so ABBREV_MAP lookups still resolve.
+        const seed = stripped || role.toLowerCase().trim();
+        if (!seed) continue;
+        for (const v of expandQualifier(seed)) qualifierTokens.add(v);
         // Single-word fallback: also accept the strongest single token
         // (e.g. "Web Analyst" → also accept "Web").
-        const tokens = stripped.split(/\s+/).filter((t) => t.length >= 2);
+        const tokens = seed.split(/\s+/).filter((t) => t.length >= 2);
         for (const tok of tokens) for (const v of expandQualifier(tok)) qualifierTokens.add(v);
     }
     function vetoQualifierMiss(decision, job) {
@@ -1671,6 +1919,15 @@ async function runAutoBatch(batch) {
         const decisionById = new Map(judge.decisions.map((d) => [d.id, d]));
         const picks = batch.filter((j) => decisionById.get(j.jobId)?.pick === true);
         state.auto.stats.picks += picks.length;
+        // Tally skipKind so admin sees role-mismatch vs threshold vs other —
+        // helps pinpoint why low-pick clients are low (bad role list vs bad
+        // threshold). Stored as a flat object: { 'role-mismatch':3, 'threshold':1, ... }
+        if (!state.auto.stats.skipsByKind) state.auto.stats.skipsByKind = {};
+        for (const d of judge.decisions) {
+            if (d.pick === true) continue;
+            const k = d.skipKind || 'threshold';
+            state.auto.stats.skipsByKind[k] = (state.auto.stats.skipsByKind[k] || 0) + 1;
+        }
         console.log('[FF-JRD] auto: judge done —', picks.length, 'picks /', batch.length, 'judged');
 
         // Stitch into state.judged so the side panel + history reflect it.
@@ -1753,6 +2010,66 @@ async function flushAutoBatch() {
     }
     if (pending.length === 0) return;
     await runAutoBatch(pending);
+}
+
+// reportSessionStat: POST one row to /extension/session-stat so the AI
+// Summaries admin page can render per-operator + per-client work-volume
+// without scraping the extension's local state. Fire-and-forget — never
+// blocks the operator's flow on network or backend availability.
+async function reportSessionStat(reason = 'stop') {
+    try {
+        const operatorName = String(state.config.operatorName || '').trim();
+        const clientEmail = String(state.config.authEmail || '').trim().toLowerCase();
+        if (!operatorName || !clientEmail) return; // nothing to report
+        const captures = state.capture.jobs?.size || 0;
+        const linkedinSkipped = state.capture.linkedinSkipped?.size || 0;
+        const stats = state.auto.stats || {};
+        // Skip empty noise — if operator opened panel, did nothing, hit Stop.
+        if (captures === 0 && (stats.judged || 0) === 0 && (stats.pushed || 0) === 0) return;
+        const startedAt = state.capture.startedAt
+            ? new Date(state.capture.startedAt).toISOString()
+            : null;
+        const skips = stats.skipsByKind || {};
+        const skipsRollup = {
+            roleMismatch: skips['role-mismatch'] || 0,
+            seniorityMismatch: skips['seniority-mismatch'] || 0,
+            locationMismatch: skips['location-mismatch'] || 0,
+            authMismatch: skips['auth-mismatch'] || 0,
+            threshold: skips.threshold || 0,
+            companyBlocked: skips['company-blocked'] || 0,
+        };
+        const skipsOther =
+            (stats.judged || 0) - (stats.picks || 0)
+            - skipsRollup.roleMismatch - skipsRollup.seniorityMismatch
+            - skipsRollup.locationMismatch - skipsRollup.authMismatch
+            - skipsRollup.threshold - skipsRollup.companyBlocked;
+        const body = {
+            extensionCode: state.config.extensionCode || '',
+            operatorName,
+            clientEmail,
+            clientName: state.config.authName || '',
+            captures,
+            linkedinSkipped,
+            judged: stats.judged || 0,
+            picks: stats.picks || 0,
+            pushed: stats.pushed || 0,
+            duplicates: stats.dupes || 0,
+            blocked: stats.blocked || 0,
+            errors: stats.errors || 0,
+            skipsByKind: skips,
+            skipsRollup: { ...skipsRollup, other: Math.max(0, skipsOther) },
+            startedAt,
+            endedAt: new Date().toISOString(),
+            extensionVersion: chrome?.runtime?.getManifest?.()?.version || '',
+            reason,
+        };
+        await dashboardFetch('/extension/session-stat', {
+            method: 'POST',
+            body: JSON.stringify(body),
+        });
+    } catch (e) {
+        console.warn('[FF-JRD] reportSessionStat failed:', e?.message);
+    }
 }
 
 async function pushSelected({ jobIds }) {
@@ -2150,7 +2467,9 @@ function dispatchMessage(msg, _sender, sendResponse) {
         // to drain whatever's pending so half-batches aren't stranded.
         state.capture.active = false;
         persistCapture().catch(() => {});
-        flushAutoBatch().catch(() => {});
+        flushAutoBatch()
+            .catch(() => {})
+            .finally(() => reportSessionStat('stop'));
         sendResponse({ ok: true, count: state.capture.jobs.size });
         return true;
     }
@@ -2158,6 +2477,7 @@ function dispatchMessage(msg, _sender, sendResponse) {
     if (msg.type === 'jrd-clear-capture') {
         // Drain auto-pipeline tail before wiping so a half-batch isn't lost.
         flushAutoBatch().catch(() => {}).finally(() => {
+            reportSessionStat('clear');
             state.capture.active = false;
             state.capture.jobs = new Map();
             state.capture.linkedinSkipped = new Map();
@@ -2176,7 +2496,10 @@ function dispatchMessage(msg, _sender, sendResponse) {
 
     if (msg.type === 'jrd-flush-auto') {
         flushAutoBatch()
-            .then(() => sendResponse({ ok: true, stats: { ...state.auto.stats } }))
+            .then(() => {
+                reportSessionStat('flush');
+                sendResponse({ ok: true, stats: { ...state.auto.stats } });
+            })
             .catch((e) => sendResponse({ ok: false, error: 'UNEXPECTED', message: e.message }));
         return true;
     }
