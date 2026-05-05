@@ -333,18 +333,19 @@ function ingestCards(jobs) {
     if (state.config.autoMode) tryAutoBatch();
 }
 
+// Heartbeat scheduler — fires after every scroll intake so the admin
+// "Today" view (Clients-Tracking) stays live. Coalesces bursts: if multiple
+// `ingestCards` calls land within 500ms (typical when JR returns 8-10
+// cards at once), only one POST goes out — but it carries the LATEST
+// cumulative count. Backend upserts on sessionId so collection size
+// stays bounded regardless of scroll volume.
 let _heartbeatTimer = null;
-let _heartbeatLastSent = 0;
 function scheduleSessionHeartbeat() {
-    const HEARTBEAT_INTERVAL_MS = 5000;
     if (_heartbeatTimer) return;
-    const now = Date.now();
-    const wait = Math.max(0, HEARTBEAT_INTERVAL_MS - (now - _heartbeatLastSent));
     _heartbeatTimer = setTimeout(() => {
         _heartbeatTimer = null;
-        _heartbeatLastSent = Date.now();
         reportSessionStat('heartbeat').catch(() => {});
-    }, wait);
+    }, 500);
 }
 
 // ---- dashboard helpers ---------------------------------------------------

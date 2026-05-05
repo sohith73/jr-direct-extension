@@ -39,16 +39,8 @@ const els = {
     liveDetail: $('live-detail'),
     liveCounts: $('live-counts'),
 
-    // today card (4-tile, today-only)
-    dailyCard:    $('daily-card'),
-    dailySub:     $('daily-sub'),
-    dailyFill:    $('daily-fill'),
-    todayRefresh: $('today-refresh'),
-    todayCaptures: $('today-captures'),
-    todayPushed:   $('today-pushed'),
-    todayLinkedin: $('today-linkedin'),
-    todayRolemiss: $('today-rolemiss'),
-    todayCap:      $('today-cap'),
+    // (TODAY card removed — admin sees the same data in Clients-Tracking
+    //  via the per-operator card backed by ExtensionSessionStat.)
 
     // settings (minimal — only cadence, threshold, auto toggle)
     aiThreshold: $('ai-threshold'),
@@ -493,6 +485,9 @@ let _dailyLoadInflight = null;
 let _dailyRefreshTimer = null;
 // Debounced refresh — auto-pipeline pushes can land in fast bursts; we
 // only want ONE /push-history hit at the tail of the burst.
+// TODAY card was removed — these are kept as no-op stubs so call sites
+// stay valid. Backend still receives data via ExtensionSessionStat
+// heartbeats and the Clients-Tracking admin view reads from there.
 function scheduleDailyRefresh(delayMs = 1500) {
     if (_dailyRefreshTimer) clearTimeout(_dailyRefreshTimer);
     _dailyRefreshTimer = setTimeout(() => {
@@ -547,25 +542,11 @@ async function loadDailyStats() {
 // LinkedIn skip / Role-miss) + cap progress bar. No history bars. Source:
 // /extension/today-stats — combines ExtensionSessionStat (today) + JobModel
 // ops count (today) + ProfileModel.targetJobCount.
-// renderTodayStats: paint the four TODAY tiles from a single source.
-//
-// payload shape:
-//   {
-//     captures, linkedinSkipped, pushed, roleMismatch  ← local accumulator
-//     cap, isDefaultCap, remaining                     ← server cap state
-//   }
-//
-// SCRAPED / LINKEDIN SKIP / ROLE-MISS read directly from the extension's
-// local `state.todayMetrics` (incremented on every event, persisted to
-// chrome.storage.local, IST-day-bucketed). PUSHED is also local but
-// validated against server-truth (capInfo) on every refresh — if the cap
-// math says we've already pushed N today, we use max(local, server).
-// This guarantees the operator-visible numbers are always accurate even
-// when network is flaky.
+// renderTodayStats: TODAY card is gone — this now ONLY syncs cap state
+// into capInfoCache + capHit + the per-client stats tile so the cap-hit
+// banner / Start button still react to dashboard cap changes. Tile DOM
+// is no longer present.
 function renderTodayStats(payload) {
-    const captures = Number(payload?.captures || 0);
-    const linkedinSkipped = Number(payload?.linkedinSkipped || 0);
-    const roleMismatch = Number(payload?.roleMismatch || 0);
     const localPushed = Number(payload?.pushed || 0);
     const serverPushed = Number(payload?.serverPushed || 0);
     const pushed = Math.max(localPushed, serverPushed);
@@ -575,7 +556,6 @@ function renderTodayStats(payload) {
         ? payload.remaining
         : Math.max(0, cap - pushed);
 
-    // Cap-gate sync — keep capHit + banner in step with server truth.
     if (cap > 0) {
         capInfoCache = {
             targetJobCount: isDefault ? null : cap,
@@ -592,40 +572,12 @@ function renderTodayStats(payload) {
         }
     }
 
-    // Per-client stats tile (sidebar) mirrors cap progress.
     if (els.clientCapStat && cap > 0) {
         els.clientCapStat.style.display = '';
         if (els.capRemaining) els.capRemaining.textContent = String(remaining);
         if (els.capTotal) els.capTotal.textContent = isDefault ? `of ${cap} (default)` : `of ${cap}`;
         els.clientCapStat.classList.toggle('over', remaining <= 0);
         els.clientCapStat.classList.toggle('warn', remaining > 0 && (remaining / Math.max(cap, 1)) <= 0.2);
-    }
-
-    // Four today tiles — single source: local todayMetrics.
-    const set = (id, val) => { const el = $(id); if (el) el.textContent = String(val); };
-    set('today-captures', captures);
-    set('today-pushed',   pushed);
-    set('today-linkedin', linkedinSkipped);
-    set('today-rolemiss', roleMismatch);
-
-    const subEl = $('today-cap');
-    if (subEl) subEl.textContent = cap > 0 ? (isDefault ? `of ${cap} (default)` : `of ${cap}`) : '';
-    const pushedTile = subEl?.parentElement;
-    if (pushedTile && cap > 0) {
-        pushedTile.classList.toggle('over', remaining <= 0);
-        pushedTile.classList.toggle('warn', remaining > 0 && remaining <= 5);
-    }
-
-    if (els.dailySub) els.dailySub.textContent = 'resets at 00:00 IST';
-
-    // Cap progress bar — pushed / cap.
-    if (els.dailyFill) {
-        const pct = cap > 0 ? Math.min(100, Math.round((pushed / cap) * 100)) : 0;
-        els.dailyFill.style.width = `${pct}%`;
-        let cls = '';
-        if (pushed >= cap) cls = 'over';
-        else if (pct >= 80) cls = 'warn';
-        els.dailyFill.className = `daily-fill ${cls}`.trim();
     }
 }
 
@@ -1743,15 +1695,11 @@ function toggleShortcutHelp(force) {
 // Boot
 refreshState();
 
-// Today tile manual refresh + 20s auto-refresh while main view is open.
-if (els.todayRefresh) {
-    els.todayRefresh.addEventListener('click', () => {
-        els.todayRefresh.classList.add('spin');
-        loadDailyStats().finally(() => setTimeout(() => els.todayRefresh.classList.remove('spin'), 400));
-    });
-}
+// Cap-state poll — TODAY card is gone but we still need cap-hit gating
+// driven by /extension/today-stats (server returns effectiveCap +
+// remaining). Polls every 30s while main view open.
 setInterval(() => {
     if (els.mainView?.hidden) return;
     if (!cfg.authEmail) return;
     loadDailyStats().catch(() => {});
-}, 20000);
+}, 30000);
