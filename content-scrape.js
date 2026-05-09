@@ -36,15 +36,35 @@
     const apiApplyLinks = new Map();
     const linkedInSkipped = new Set();
 
-    function isLinkedInUrl(url) {
+    // Hosts whose apply links we refuse to push to the dashboard. Operator
+    // policy: skip generic aggregators (LinkedIn / Dice), employer
+    // career-portal aliases the dashboard already covers (TikTok's
+    // lifeattiktok.com), and specific employers ops asked to exclude
+    // (Dick's Sporting Goods Workday tenant). Add new hostnames to BOTH
+    // regexes — anchored for normal URLs, loose for malformed strings.
+    // Anchored host matches — must equal the hostname or end with the
+    // entry. Use for aggregators (linkedin/dice), career-portal aliases
+    // (lifeattiktok, dataannotation), and SPECIFIC Workday tenants
+    // (humana.wd5.myworkdayjobs.com — does NOT bleed onto other tenants).
+    const BLOCKED_HOST_RX = /(^|\.)(linkedin\.com|dice\.com|indeed\.com|lifeattiktok\.com|dataannotation\.tech|jobs\.apple\.com|humana\.wd5\.myworkdayjobs\.com)$/i;
+    // Substring tokens — fires anywhere in URL/hostname. Use only for
+    // employer-specific blocks where the subdomain pattern varies (e.g.
+    // dickssportinggoods.wd1.myworkdayjobs.com vs dickssportinggoods.com).
+    const BLOCKED_SUBSTRING_RX = /(linkedin\.com|dice\.com|indeed\.com|lifeattiktok\.com|dataannotation\.tech|dickssportinggoods)/i;
+    function isBlockedApplyUrl(url) {
         if (!url || typeof url !== 'string') return false;
+        // Substring check first — covers employer-tenant blocks (e.g.
+        // dickssportinggoods on Workday) regardless of how the host is
+        // structured. Hostname check then catches malformed URLs.
+        if (BLOCKED_SUBSTRING_RX.test(url)) return true;
         try {
-            const u = new URL(url);
-            return /(^|\.)linkedin\.com$/i.test(u.hostname);
+            return BLOCKED_HOST_RX.test(new URL(url).hostname);
         } catch {
-            return /linkedin\.com/i.test(url);
+            return BLOCKED_SUBSTRING_RX.test(url);
         }
     }
+    // Legacy name kept as alias so call sites + ticker labels read clean.
+    const isLinkedInUrl = isBlockedApplyUrl;
 
     function ingestApiJobs(jobs) {
         if (!Array.isArray(jobs)) return 0;

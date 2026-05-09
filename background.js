@@ -827,11 +827,24 @@ const OPS_NAME = 'JR Direct (Extension)';
 const JR_FALLBACK_RX = /^https?:\/\/jobright\.ai\/jobs\/info\/[a-f0-9]{24}\b/i;
 const applyLinkCache = new Map(); // jobId → real applyLink (resolved from JR)
 
-function isLinkedInUrlBg(url) {
+// Hosts whose apply links we refuse to push to the dashboard (operator
+// policy — direct employer career-site links only). Mirrors the same
+// list in content-scrape.js → keep BOTH in sync. Add new hostnames to
+// BLOCKED_HOST_RX (anchored at hostname end) + BLOCKED_LOOSE_RX so a
+// URL-parser failure still catches them.
+// Anchored host matches — hostname-end match. Aggregators + career-portal
+// aliases + SPECIFIC Workday tenants (humana.wd5 only — other tenants pass).
+const BLOCKED_HOST_RX_BG = /(^|\.)(linkedin\.com|dice\.com|indeed\.com|lifeattiktok\.com|dataannotation\.tech|jobs\.apple\.com|humana\.wd5\.myworkdayjobs\.com)$/i;
+// Substring tokens — employer-specific where subdomain pattern varies.
+const BLOCKED_SUBSTRING_RX_BG = /(linkedin\.com|dice\.com|indeed\.com|lifeattiktok\.com|dataannotation\.tech|dickssportinggoods)/i;
+function isBlockedApplyUrlBg(url) {
     if (!url || typeof url !== 'string') return false;
-    try { return /(^|\.)linkedin\.com$/i.test(new URL(url).hostname); }
-    catch { return /linkedin\.com/i.test(url); }
+    if (BLOCKED_SUBSTRING_RX_BG.test(url)) return true;
+    try { return BLOCKED_HOST_RX_BG.test(new URL(url).hostname); }
+    catch { return BLOCKED_SUBSTRING_RX_BG.test(url); }
 }
+// Legacy name retained so existing call sites + log lines keep their text.
+const isLinkedInUrlBg = isBlockedApplyUrlBg;
 
 // composeJobDescription: merge JR's structured JD fields into the single
 // plain-text blob the dashboard's `jobDescription` column expects.
@@ -2639,22 +2652,28 @@ function dispatchMessage(msg, _sender, sendResponse) {
     }
 
     if (msg.type === 'jrd-clear-capture') {
-        // Drain auto-pipeline tail before wiping so a half-batch isn't lost.
-        flushAutoBatch().catch(() => {}).finally(() => {
-            reportSessionStat('clear');
-            state.capture.active = false;
-            state.capture.jobs = new Map();
-            state.capture.linkedinSkipped = new Map();
-            state.capture.startedAt = null;
-            state.judged = null;
-            state.auto.processed = new Set();
-            state.auto.profile = null;
-            state.auto.aiSummary = '';
-            state.auto.stats = { judged: 0, picks: 0, pushed: 0, dupes: 0, blocked: 0, errors: 0 };
-            setBadge(0);
-            chrome.storage.session.remove(Object.values(PERSIST_KEYS)).catch(() => {});
-            sendResponse({ ok: true });
-        });
+        // Hard-reset path. Reset = explicit nuke; do NOT await flush — when
+        // an auto-batch is wedged (autoRunning stuck true) the await hangs
+        // sendResponse forever and the sidepanel's await never resolves,
+        // making Reset look broken. Fire telemetry + flush async, but wipe
+        // local state synchronously so the operator's click always succeeds.
+        reportSessionStat('clear').catch(() => {});
+        flushAutoBatch().catch(() => {}); // fire-and-forget drain attempt
+        state.capture.active = false;
+        state.capture.jobs = new Map();
+        state.capture.linkedinSkipped = new Map();
+        state.capture.startedAt = null;
+        state.capture.sessionId = '';
+        state.judged = null;
+        state.auto.running = false; // unstick wedged flag
+        state.auto.runningPromise = null;
+        state.auto.processed = new Set();
+        state.auto.profile = null;
+        state.auto.aiSummary = '';
+        state.auto.stats = { judged: 0, picks: 0, pushed: 0, dupes: 0, blocked: 0, errors: 0, skipsByKind: {} };
+        setBadge(0);
+        chrome.storage.session.remove(Object.values(PERSIST_KEYS)).catch(() => {});
+        sendResponse({ ok: true });
         return true;
     }
 
