@@ -1141,6 +1141,27 @@ quote the matched excludedRole verbatim ("Skip — title 'QA Technician'
 matches excluded role 'Technician'; candidate opted out of those").
 This rule overrides every other signal, including high JR match scores.
 
+acceptedEmploymentTypes is the candidate's allowed employment-type list
+(values: "Full-time", "Part-time", "Contract", "Internship"). If the
+job's employmentType / "tags" / JD body indicates the role is one of the
+REJECTED types (anything in rejectedEmploymentTypes — the complement),
+you MUST set pick=false with skipKind="other" and the reason MUST cite
+the mismatch ("Skip — listing is Contract; candidate accepts only
+Full-time."). Signals to read: job.employmentType field, "contract" /
+"contractor" / "C2H" / "1099" / "temp" / "intern" / "internship" /
+"part-time" / "PT" in the title or JD body. When unclear, prefer SKIP
+over PICK for safety.
+
+POSTING AGE — HARD 48-HOUR CUTOFF. Each job has a "publishedAt" field
+(a relative string like "5 hours ago", "2 days ago", "1 week ago",
+"30+ days ago"). If the posting is OLDER than 48 hours, you MUST set
+pick=false with skipKind="other" and the reason MUST cite the age
+("Skip — posted 2 days ago, older than the 48-hour window."). Treat
+anything saying days/weeks/months ago (except "1 day ago" or "today"
+or "X hours ago" where X <= 48) as older than 48 hours. "Yesterday"
+and "1 day ago" are IN scope. When publishedAt is empty or unparseable,
+do NOT skip on age — judge on the other signals.
+
 Each job in "Jobs to judge" includes a "jd" field — the FULL composed
 job description (responsibilities + must-haves + nice-to-haves + skills
 + benefits, up to 4500 chars). When jdSource="full" you MUST read the
@@ -1327,12 +1348,23 @@ function buildUserPrompt({ profile, jobs, threshold, aiSummary }) {
     const rolesRaw = fmtList(profile?.preferredRoles);
     const { preferred: preferredRoles, excluded: excludedRoles } = splitRoles(rolesRaw);
     const preferredLocations = fmtList(profile?.preferredLocations);
+    // Employment types — multi-select from /profile UI. Defaults to
+    // ["Full-time"] when never set so legacy clients keep current behavior.
+    const ALL_EMP = ['Full-time', 'Part-time', 'Contract', 'Internship'];
+    const rawEmp = Array.isArray(profile?.employmentTypes) ? profile.employmentTypes : [];
+    const acceptedEmp = rawEmp
+        .map((v) => String(v || '').trim())
+        .filter((v) => ALL_EMP.includes(v));
+    const employmentTypes = acceptedEmp.length ? acceptedEmp : ['Full-time'];
+    const rejectedEmp = ALL_EMP.filter((t) => !employmentTypes.includes(t));
     const hardSignals = {
         preferredRoles: preferredRoles.length ? preferredRoles : '(not specified — fall back to summary)',
         excludedRoles: excludedRoles.length ? excludedRoles : [],
         experienceLevel: profile?.experienceLevel || '(not specified)',
         preferredLocations: preferredLocations.length ? preferredLocations : '(not specified)',
         workAuth: profile?.usWorkEligibility || profile?.visaStatus || '(not specified)',
+        acceptedEmploymentTypes: employmentTypes,
+        rejectedEmploymentTypes: rejectedEmp,
         excludedCompanies: profile?.excludedCompanies || profile?.removedCompanies || [],
     };
     const hardSignalsBlock = `## Candidate hard signals (AUTHORITATIVE — quote these exact role strings in your reason)\n${JSON.stringify(hardSignals, null, 2)}\n`;
