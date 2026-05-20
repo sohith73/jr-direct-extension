@@ -1454,3 +1454,51 @@ small.hint code {
 ::-webkit-scrollbar-track { background: var(--bg); }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }
+
+/* ---- hiring.cafe MODE ---- */
+.hcafe-view {
+    flex-direction: column;
+    gap: 10px;
+    align-items: stretch;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+}
+.hcafe-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.hcafe-badge {
+    font-size: 11px; font-weight: 700; letter-spacing: 0.3px;
+    color: #0d1117; background: var(--accent);
+    padding: 2px 8px; border-radius: 999px;
+}
+.hcafe-sub { color: var(--fg-dim); font-size: 11.5px; }
+.hcafe-field { display: flex; flex-direction: column; gap: 4px; }
+.hcafe-field > label { font-size: 11.5px; color: var(--fg-dim); font-weight: 600; }
+.hcafe-field > label small { color: var(--fg-muted); font-weight: 400; }
+.hcafe-field.hcafe-inline > label {
+    flex-direction: row; display: flex; align-items: center; gap: 7px;
+    color: var(--fg); font-size: 12.5px;
+}
+.hcafe-field.hcafe-inline input[type="checkbox"] { width: auto; }
+.hcafe-actions { display: flex; gap: 8px; }
+.hcafe-actions > button { flex: 1; }
+.hcafe-status { font-size: 11.5px; color: var(--fg-dim); min-height: 16px; }
+.hcafe-status.ok { color: var(--green); }
+.hcafe-status.warn { color: var(--yellow); }
+.hcafe-status.error { color: var(--red); }
+
+/* hiring.cafe hard-stop button */
+.hcafe-stop-btn {
+    flex: 1;
+    padding: 8px 12px;
+    background: rgba(248, 113, 113, 0.12);
+    color: var(--red);
+    border: 1px solid var(--red);
+    border-radius: 6px;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+.hcafe-stop-btn:hover { background: rgba(248, 113, 113, 0.22); }
+.hcafe-stop-btn:disabled { opacity: 0.5; cursor: default; }

@@ -420,13 +420,24 @@
     // chrome.runtime messages from sidepanel → content
     chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         if (!msg || typeof msg !== 'object') return false;
+        if (msg.type === 'jrd-capture-state') {
+            // SW capture state changed (Start/Stop/Reset). JR's scraper is
+            // scroll-driven so we just clear `seen` on Start/Reset — the
+            // virtualised list will re-emit cards as the operator scrolls.
+            if (msg.kind === 'start' || msg.kind === 'reset') {
+                seen.clear();
+                harvestVisible();
+            }
+            sendResponse({ ok: true });
+            return true;
+        }
         if (msg.type === 'jrd-reset-content-cache') {
             seen.clear();
             sendResponse({ ok: true });
             return true;
         }
         if (msg.type === 'jrd-content-stats') {
-            sendResponse({ seen: seen.size });
+            sendResponse({ seen: seen.size, site: 'jobright', captureActive: true, cachedPages: [] });
             return true;
         }
         if (msg.type === 'jrd-toggle-panel') {

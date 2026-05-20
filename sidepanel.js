@@ -74,6 +74,11 @@ const els = {
     capTotal: $('cap-total'),
     linkedinSkippedCount: $('linkedin-skipped-count'),
     activeState: $('active-state'),
+    // today-row stats (daily aggregates across all sessions)
+    todayCaptures: $('today-captures'),
+    todayPushed: $('today-pushed'),
+    todayRoleMiss: $('today-role-miss'),
+    todayLiSkip: $('today-li-skip'),
     phase: $('phase'),
     batchInfo: $('batch-info'),
     statusDot: $('status-dot'),
@@ -102,7 +107,48 @@ const els = {
 
     // footer
     processingWarn: $('processing-warn'),
+
+    // hiring.cafe MODE
+    hcafeView: $('hcafe-view'),
+    hcafeQuery: $('hcafe-query'),
+    hcafeCountry: $('hcafe-country'),
+    hcafePast24: $('hcafe-past24'),
+    hcafeMaxPages: $('hcafe-maxpages'),
+    hcafeRun: $('hcafe-run'),
+    hcafeStop: $('hcafe-stop'),
+    hcafeStatus: $('hcafe-status'),
+    actionsRow: $('actions'),
 };
+
+// Panel site mode. The hiring.cafe content script mounts the iframe with
+// ?site=hcafe → the panel renders the API-scrape filter form instead of the
+// JR scroll-capture controls. jobright.ai mounts it plain (?site absent).
+const PANEL_SITE = (() => {
+    try { return new URLSearchParams(location.search).get('site') || 'jobright'; }
+    catch { return 'jobright'; }
+})();
+const isHcafe = PANEL_SITE === 'hcafe';
+
+// Countries offered in the hiring.cafe country filter. code = ISO-3166-1
+// alpha-2; background.js maps it to the Places-shaped location object.
+const HCAFE_COUNTRIES = [
+    { name: 'Any country', code: '' },
+    { name: 'United States', code: 'US' },
+    { name: 'Canada', code: 'CA' },
+    { name: 'United Kingdom', code: 'GB' },
+    { name: 'India', code: 'IN' },
+    { name: 'Germany', code: 'DE' },
+    { name: 'Australia', code: 'AU' },
+    { name: 'Singapore', code: 'SG' },
+    { name: 'Netherlands', code: 'NL' },
+    { name: 'Ireland', code: 'IE' },
+    { name: 'France', code: 'FR' },
+    { name: 'United Arab Emirates', code: 'AE' },
+    { name: 'New Zealand', code: 'NZ' },
+];
+
+// Mirrors background.state — true while a hiring.cafe API run is in flight.
+let hcafeRunning = false;
 
 let cfg = {
     aiThreshold: 50,
@@ -252,8 +298,35 @@ async function send(type, payload = {}) {
     }
     if (r && !r.ok && TRANSIENT.includes(r.error)) {
         console.error('[FF-JRD] send', type, 'gave up after', attempt, 'attempts:', r.message);
+        // "Extension context invalidated" is the unmistakable signature of
+        // the user reloading the extension while a page using it was open.
+        // The iframe + content-script now live in a dead context — every
+        // chrome.runtime.* call will keep failing. Surface this once so
+        // the panel can render a "Refresh page" banner instead of silent
+        // SW_THROW spam.
+        if (typeof r.message === 'string' && /context invalidated/i.test(r.message)) {
+            r.error = 'CONTEXT_INVALIDATED';
+            r.message = 'Extension was reloaded while this page was open. Refresh hiring.cafe (or your JR tab) with Ctrl+Shift+R to reconnect.';
+            if (typeof renderContextInvalidatedBanner === 'function') {
+                try { renderContextInvalidatedBanner(); } catch {}
+            }
+        }
     }
     return r;
+}
+
+// Render a sticky banner once the extension context is dead. The user MUST
+// hard-refresh the host page to revive the iframe + content-script handles.
+let __ctxInvalidatedShown = false;
+function renderContextInvalidatedBanner() {
+    if (__ctxInvalidatedShown) return;
+    __ctxInvalidatedShown = true;
+    try {
+        const bar = document.createElement('div');
+        bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;padding:10px 14px;background:#b91c1c;color:#fff;font:600 13px/1.4 -apple-system,system-ui,sans-serif;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,0.4);';
+        bar.textContent = '⚠ Extension reloaded — hard-refresh this page (Ctrl+Shift+R) to reconnect.';
+        document.body.appendChild(bar);
+    } catch {}
 }
 
 // Keep the service worker alive while the panel is open. MV3 evicts SW
@@ -261,7 +334,9 @@ async function send(type, payload = {}) {
 // keeps the worker's idle timer reset so login + judge + push don't
 // silently lose their async response.
 let keepalivePort = null;
+let keepaliveDead = false; // set once context is invalidated — stop retrying
 function openKeepalive() {
+    if (keepaliveDead) return;
     try {
         keepalivePort = chrome.runtime.connect({ name: 'jrd-keepalive' });
         keepalivePort.onDisconnect.addListener(() => {
@@ -269,7 +344,17 @@ function openKeepalive() {
             // Reconnect on next interval tick — helps survive SW restarts.
         });
     } catch (e) {
-        console.warn('[FF-JRD] keepalive connect failed:', e?.message);
+        const msg = e?.message || '';
+        if (/context invalidated/i.test(msg)) {
+            // Extension was reloaded; this iframe is a zombie. Stop spamming.
+            keepaliveDead = true;
+            if (typeof renderContextInvalidatedBanner === 'function') {
+                try { renderContextInvalidatedBanner(); } catch {}
+            }
+            console.warn('[FF-JRD] keepalive dead — extension context invalidated. Refresh page.');
+            return;
+        }
+        console.warn('[FF-JRD] keepalive connect failed:', msg);
     }
 }
 openKeepalive();
@@ -309,6 +394,7 @@ function showMain() {
     renderPreferredRoles();
     renderSummarySection();
     renderCapHitBanner();
+    applyHcafeMode();
     // Pull today's count + 14-day sparkline. Fire-and-forget — UI shows
     // a friendly skeleton while it loads.
     loadDailyStats().catch((e) => console.warn('[FF-JRD] loadDailyStats failed', e?.message));
@@ -330,6 +416,181 @@ function showMain() {
             applyState();
         }
     }).catch(() => {});
+}
+
+// ---- hiring.cafe MODE ----------------------------------------------------
+//
+// When the panel is opened on hiring.cafe the JR scroll-capture controls are
+// hidden and a filter form is shown instead. The operator sets role / country
+// / past-24h, clicks Run, and the service worker fetches hiring.cafe's JSON
+// API page by page — judging + pushing through the same pipeline.
+
+// applyHcafeMode: one-time DOM swap between JR and hiring.cafe layouts. Safe
+// to call repeatedly (idempotent).
+function applyHcafeMode() {
+    if (!isHcafe) {
+        if (els.hcafeView) els.hcafeView.hidden = true;
+        return;
+    }
+    // Hide JR-only controls — scroll capture has no meaning here.
+    if (els.actionsRow) els.actionsRow.hidden = true;
+    if (els.hcafeView) els.hcafeView.hidden = false;
+    // Re-label the "Captured / 100" tile — hiring.cafe runs aren't buffer-
+    // capped; the number is just jobs scraped this run.
+    const countLabel = els.count?.closest('.stat')?.querySelector('.label');
+    if (countLabel) countLabel.textContent = 'Scraped';
+    if (els.captureCap) els.captureCap.hidden = true;
+    // LinkedIn-skip tile is JR-specific (hiring.cafe apply URLs are direct
+    // ATS links) — drop it from the hiring.cafe layout.
+    els.linkedinSkippedCount?.closest('.stat')?.style.setProperty('display', 'none');
+    document.title = 'FlashFire hiring.cafe → Dashboard';
+    const h1 = document.querySelector('header h1');
+    if (h1) h1.textContent = 'FlashFire hiring.cafe → Dashboard';
+    populateHcafeCountries();
+    applyHcafeRunState();
+}
+
+function populateHcafeCountries() {
+    if (!els.hcafeCountry || els.hcafeCountry.options.length) return;
+    for (const c of HCAFE_COUNTRIES) {
+        const opt = document.createElement('option');
+        opt.value = c.code;
+        opt.textContent = c.name;
+        els.hcafeCountry.appendChild(opt);
+    }
+    els.hcafeCountry.value = 'US'; // sensible default for FlashFire clients
+}
+
+function getSelectedHcafeCountry() {
+    const code = els.hcafeCountry?.value || '';
+    if (!code) return null;
+    const found = HCAFE_COUNTRIES.find((c) => c.code === code);
+    return found ? { name: found.name, code: found.code } : null;
+}
+
+function setHcafeStatus(text, kind = '') {
+    if (!els.hcafeStatus) return;
+    els.hcafeStatus.className = `hcafe-status ${kind}`;
+    els.hcafeStatus.textContent = text || '';
+}
+
+// applyHcafeRunState: paint the Run/Stop controls. Start always supersedes a
+// prior run, so it stays enabled; Stop is ALWAYS available so the operator
+// can kill a wedged backend run even when this panel session didn't launch it.
+function applyHcafeRunState() {
+    if (!isHcafe) return;
+    if (els.hcafeRun) {
+        els.hcafeRun.hidden = false;
+        els.hcafeRun.disabled = capHit;
+        els.hcafeRun.textContent = hcafeRunning ? 'Restart run' : 'Start hiring.cafe run';
+        els.hcafeRun.title = capHit
+            ? 'Client cap reached — raise the target on the dashboard first.'
+            : (hcafeRunning ? 'Stops the current run and starts a fresh one.' : '');
+    }
+    if (els.hcafeStop) {
+        els.hcafeStop.hidden = false;
+        els.hcafeStop.disabled = false;
+    }
+    // Form stays editable — each Start reads the fields fresh.
+    for (const el of [els.hcafeQuery, els.hcafeCountry, els.hcafePast24, els.hcafeMaxPages]) {
+        if (el) el.disabled = false;
+    }
+}
+
+async function startHcafeRun() {
+    if (capHit) { setHcafeStatus('Client cap reached — raise the cap first.', 'error'); return; }
+    const filters = {
+        searchQuery: (els.hcafeQuery?.value || '').trim(),
+        country: getSelectedHcafeCountry(),
+        past24: !!els.hcafePast24?.checked,
+        maxPages: Math.min(Math.max(Number(els.hcafeMaxPages?.value) || 5, 1), 50),
+    };
+    if (!filters.searchQuery && !filters.country) {
+        setHcafeStatus('Enter a role keyword or pick a country first.', 'warn');
+        return;
+    }
+    // Clean slate for this run.
+    decisionsMap.clear();
+    rebuildList();
+    els.outcomesRow.hidden = true;
+    els.decisionsSection.hidden = true;
+    els.progressSection.hidden = true;
+    els.activityTicker.innerHTML = '';
+    captureCount = 0;
+    if (els.count) els.count.textContent = '0';
+    els.picksCount.textContent = '0';
+    els.pushedCount.textContent = '0';
+    isJudged = false;
+    resetLiveCounts();
+
+    hcafeRunning = true;
+    applyHcafeRunState();
+    let buildVer = '?';
+    try { buildVer = chrome.runtime.getManifest().version; } catch {}
+    console.log('[FF-JRD] startHcafeRun — panel build', buildVer, 'filters', filters);
+    setHcafeStatus(`Starting run… (build ${buildVer})`);
+    const r = await send('jrd-hcafe-start', { filters });
+    if (r?.ok) {
+        captureActive = true;
+        ensureSectionVisible();
+        setLive('hiring.cafe run', 'Fetching pages from the hiring.cafe API…');
+        const ctry = filters.country ? filters.country.name : 'Any country';
+        setHcafeStatus(
+            `Running — "${filters.searchQuery || '(no keyword)'}" · ${ctry}`
+            + `${filters.past24 ? ' · past 24h' : ''} · up to ${filters.maxPages} pages.`,
+            'ok',
+        );
+    } else {
+        hcafeRunning = false;
+        captureActive = false;
+        applyHcafeRunState();
+        const err = r?.error || 'UNKNOWN';
+        if (err === 'CAP_HIT') {
+            capHit = true;
+            capInfoCache = r?.capInfo || capInfoCache;
+            renderCapHitBanner();
+            setHcafeStatus('Client cap reached — raise it in Clients-Tracking → AI Summary.', 'error');
+        } else if (err === 'ALREADY_RUNNING') {
+            // Older SW build — supersede manually: stop, then retry once.
+            setHcafeStatus('A previous run is active — stopping it first…', 'warn');
+            await send('jrd-hcafe-stop').catch(() => {});
+            await new Promise((rs) => setTimeout(rs, 400));
+            const r2 = await send('jrd-hcafe-start', { filters });
+            if (r2?.ok) {
+                hcafeRunning = true;
+                captureActive = true;
+                ensureSectionVisible();
+                applyHcafeRunState();
+                setHcafeStatus('Previous run stopped — new run started.', 'ok');
+            } else {
+                setHcafeStatus(`Still failed: ${r2?.error || 'UNKNOWN'}. Click ⏹ Stop run, then Start.`, 'error');
+            }
+        } else if (err === 'SW_CHANNEL' || err === 'UNKNOWN_MESSAGE') {
+            // The service worker didn't answer this handler. Almost always
+            // the running SW is an older build than the panel.
+            setHcafeStatus(
+                `SW out of date — panel is build ${buildVer} but the service worker has no `
+                + `hiring.cafe handler. Go to chrome://extensions, REMOVE this extension, `
+                + `then "Load unpacked" the jr-direct-extension folder again.`,
+                'error',
+            );
+        } else {
+            setHcafeStatus(`Failed to start: ${err} ${r?.message || ''} (build ${buildVer})`, 'error');
+        }
+    }
+}
+
+async function stopHcafeRun() {
+    setHcafeStatus('Stopping — killing scrape + judging…', 'warn');
+    if (els.hcafeStop) els.hcafeStop.disabled = true;
+    await send('jrd-hcafe-stop').catch(() => {});
+    hcafeRunning = false;
+    captureActive = false;
+    autoRunning = false;
+    applyHcafeRunState();
+    setLive('Stopped', 'hiring.cafe run halted.', 'warn');
+    hideLive(1800);
+    setHcafeStatus('Stopped — all hiring.cafe scraping + judging halted. Press Start for a fresh run.', 'ok');
 }
 
 // refreshProfileFromServer: pulls the live profile (and therefore aiSummary)
@@ -579,6 +840,17 @@ function renderTodayStats(payload) {
         els.clientCapStat.classList.toggle('over', remaining <= 0);
         els.clientCapStat.classList.toggle('warn', remaining > 0 && (remaining / Math.max(cap, 1)) <= 0.2);
     }
+
+    // Paint the TODAY row (across all sessions today). Live from SW
+    // todayMetrics — survives panel reload, SW eviction.
+    const todayCaptures = Number(payload?.captures || 0);
+    const todayLi = Number(payload?.linkedinSkipped || 0);
+    const todayRoleMiss = Number(payload?.roleMismatch || 0);
+    const todayPushed = pushed; // already max(local, server)
+    if (els.todayCaptures) els.todayCaptures.textContent = String(todayCaptures);
+    if (els.todayPushed) els.todayPushed.textContent = String(todayPushed);
+    if (els.todayRoleMiss) els.todayRoleMiss.textContent = String(todayRoleMiss);
+    if (els.todayLiSkip) els.todayLiSkip.textContent = String(todayLi);
 }
 
 function setCodeMessage(text, kind = '') {
@@ -892,6 +1164,62 @@ function ingestDecision({ decision, job }) {
     ensureSectionVisible();
     rebuildList();
     updatePushButton();
+    maybeRenderZeroPickDiagnostic();
+}
+
+// Diagnose persistent 0-pick runs. The pipeline can technically work
+// perfectly (scrape → judge → push) while still pushing zero jobs if the
+// candidate profile doesn't match the search filter on the source site.
+// Operator stares at "Today scraped 306 / Pushed 0" and assumes the
+// scraper is broken. Surface the AI's actual skip reasons so they can
+// either tighten the search or relax the candidate profile.
+const ZERO_PICK_TRIGGER = 16; // 2 full batches before warning
+function maybeRenderZeroPickDiagnostic() {
+    const all = [...decisionsMap.values()];
+    const total = all.length;
+    if (total < ZERO_PICK_TRIGGER) return hideZeroPickBanner();
+    const picks = all.filter((e) => !!e.decision?.pick).length;
+    if (picks > 0) return hideZeroPickBanner();
+    // Tally skip kinds.
+    const kindCounts = new Map();
+    for (const e of all) {
+        const k = (e.decision?.skipKind || 'other');
+        kindCounts.set(k, (kindCounts.get(k) || 0) + 1);
+    }
+    const sorted = [...kindCounts.entries()].sort((a, b) => b[1] - a[1]);
+    const topThree = sorted.slice(0, 3).map(([k, n]) => `${skipKindLabel(k)}: ${n}`).join(' · ');
+    // Suggest based on the dominant skip kind.
+    const dominant = sorted[0]?.[0];
+    let hint = '';
+    if (dominant === 'seniority-mismatch' || dominant === 'role-mismatch') {
+        hint = 'Most jobs reject on role/seniority. Tighten search on the source site (e.g. add "Junior" or "Entry-level" to the hcafe query) OR raise candidate experienceLevel on the dashboard.';
+    } else if (dominant === 'location-mismatch') {
+        hint = 'Most jobs reject on location. Adjust hcafe location filter to match candidate preferredLocations.';
+    } else if (dominant === 'auth-mismatch') {
+        hint = 'Most jobs need work auth the candidate lacks. Filter sponsor-friendly only on hcafe.';
+    } else if (dominant === 'threshold') {
+        hint = 'Jobs score just below threshold. Lower AI threshold in settings.';
+    } else {
+        hint = 'Try widening or narrowing search on hiring.cafe / JR — current matches are too far from the candidate profile.';
+    }
+    renderZeroPickBanner({ total, topThree, hint });
+}
+
+function renderZeroPickBanner({ total, topThree, hint }) {
+    let bar = document.getElementById('zero-pick-banner');
+    if (!bar) {
+        bar = document.createElement('div');
+        bar.id = 'zero-pick-banner';
+        bar.style.cssText = 'margin:10px 12px;padding:10px 12px;background:#7c2d12;color:#fff7ed;border-radius:8px;font:600 12px/1.4 -apple-system,system-ui,sans-serif;border:1px solid #c2410c;';
+        const row = els.outcomesRow?.parentElement || document.body;
+        (els.outcomesRow || row).insertAdjacentElement('beforebegin', bar);
+    }
+    bar.innerHTML = `⚠ <b>0 picks across ${total} judged.</b><br>Top skip reasons: ${escapeHtml(topThree)}<br><span style="font-weight:400;opacity:0.9">${escapeHtml(hint)}</span>`;
+}
+
+function hideZeroPickBanner() {
+    const bar = document.getElementById('zero-pick-banner');
+    if (bar) bar.remove();
 }
 
 function ingestPushStart({ jobId, title, company }) {
@@ -953,6 +1281,9 @@ async function refreshState() {
         captureCount = s.capture?.count || 0;
         linkedinSkippedCount = s.capture?.linkedinSkipped || 0;
         captureActive = !!s.capture?.active;
+        // hiring.cafe panel reopened mid-run — mirror the SW's run flag so
+        // the form stays disabled + Stop stays visible.
+        if (isHcafe) hcafeRunning = !!s.capture?.active;
         autoRunning = !!s.auto?.running;
         capHit = !!s.auto?.capHit;
         capInfoCache = s.auto?.capInfo || null;
@@ -1188,9 +1519,41 @@ async function startCapture() {
         captureActive = true;
         captureCount = 0;
         applyState();
-        setMessage('Capture started. Open jobright.ai/jobs/recommend and scroll.', 'ok');
-        setLive('Capturing', 'Scroll JR — auto-pipeline kicks off every batch.');
-    } else { setMessage('Failed to start capture.', 'error'); }
+        // Verify the content script on the active scraping tab is alive.
+        // Returns per-tab health so the operator immediately learns if the
+        // tab is zombified by an extension reload and needs Ctrl+Shift+R.
+        const health = await send('jrd-broadcast-health').catch(() => null);
+        if (health?.ok) {
+            const alive = (health.tabs || []).filter((t) => t.alive);
+            const dead = (health.tabs || []).filter((t) => !t.alive);
+            if (alive.length === 0 && dead.length === 0) {
+                setMessage('Capture started — but no scraping tab is open. Open jobright.ai/jobs/recommend or hiring.cafe.', 'warn');
+            } else if (alive.length === 0) {
+                setMessage(`Capture started — but ${dead.length} scraping tab(s) need a refresh. Hard-refresh them (Ctrl+Shift+R).`, 'warn');
+            } else {
+                const hostMsg = alive.map((t) => `${t.host}${t.captureActive === false ? ' (resyncing)' : ''}`).join(', ');
+                setMessage(`Capture started on ${hostMsg}. Scroll JR / click hiring.cafe pages.`, 'ok');
+            }
+        } else {
+            setMessage('Capture started. Open jobright.ai (scroll) or hiring.cafe (click pages).', 'ok');
+        }
+        setLive('Capturing', 'Scroll JR / click hiring.cafe pages — auto-pipeline runs per batch.');
+    } else {
+        // Surface the exact failure so the operator can act on it (cap reached,
+        // SW evicted, login expired, etc.) instead of staring at a generic toast.
+        const err = r?.error || 'UNKNOWN';
+        const msg = r?.message || '(no detail from service worker)';
+        console.warn('[FF-JRD] start-capture failed', { err, msg, full: r });
+        if (err === 'CAP_HIT') {
+            setMessage('Daily client cap reached — raise it in Clients-Tracking → AI Summary, then try again.', 'error');
+        } else if (err === 'CONTEXT_INVALIDATED') {
+            setMessage(msg, 'error');
+        } else if (err === 'SW_CHANNEL' || err === 'SW_NO_RESPONSE' || err === 'SW_THROW') {
+            setMessage(`Service worker is sleeping or wedged (${err}). Hard-refresh this page (Ctrl+Shift+R). If still failing, reload extension at chrome://extensions.`, 'error');
+        } else {
+            setMessage(`Failed to start capture — ${err}: ${msg}`, 'error');
+        }
+    }
 }
 
 // runJudgeNow: process anything captured-but-unprocessed RIGHT NOW without
@@ -1552,6 +1915,54 @@ chrome.runtime.onMessage.addListener((msg) => {
             pushTickerLine(`✓ resolve done: ${text}`);
             break;
         }
+        case 'hcafe-page':
+            // One page of the hiring.cafe API scrape landed.
+            captureCount = typeof msg.scraped === 'number' ? msg.scraped : captureCount;
+            if (els.count) els.count.textContent = String(captureCount);
+            setHcafeStatus(
+                `Page ${(msg.page ?? 0) + 1} — ${msg.fresh} new · ${msg.scraped} scraped of ~${msg.total} matches.`,
+                'ok',
+            );
+            pushTickerLine(
+                `hiring.cafe page ${(msg.page ?? 0) + 1} — ${msg.fresh} new (${msg.scraped} total)`,
+                'batch',
+            );
+            break;
+        case 'hcafe-phase':
+            if (msg.phase === 'page-error') {
+                setHcafeStatus(`Page ${(msg.page ?? 0) + 1} error: ${msg.error} — run stopped.`, 'error');
+            }
+            break;
+        case 'hcafe-done': {
+            hcafeRunning = false;
+            captureActive = false;
+            applyHcafeRunState();
+            if (msg.reason === 'stopped') {
+                // Manual hard-stop — stopHcafeRun already painted the status.
+                hideLive(800);
+                break;
+            }
+            if (msg.error) {
+                const detail = msg.error === 'NO_BUILD_ID'
+                    ? 'could not read hiring.cafe build id (site may be down).'
+                    : `${msg.error} ${msg.message || ''}`;
+                setHcafeStatus(`Run failed — ${detail}`, 'error');
+                setLive('Run failed', String(msg.error), 'error');
+                hideLive(3200);
+            } else {
+                const s = msg.stats || {};
+                setHcafeStatus(
+                    `✓ Done — ${msg.pages} page(s), ${msg.scraped} scraped · judged ${s.judged || 0}`
+                    + ` · picks ${s.picks || 0} · pushed ${s.pushed || 0} · dupes ${s.dupes || 0}`
+                    + ` · blocked ${s.blocked || 0} · errors ${s.errors || 0}.`,
+                    s.pushed > 0 ? 'ok' : 'warn',
+                );
+                setLive('Run complete', `${s.pushed || 0} pushed of ${s.picks || 0} picks.`, 'success');
+                hideLive(2800);
+            }
+            setTimeout(() => loadDailyStats().catch(() => {}), 600);
+            break;
+        }
         case 'summary-phase': {
             const map = { 'requesting': 'POSTing /build-ai-summary…', 'done': 'Summary saved.' };
             const text = map[msg.phase] || msg.phase;
@@ -1579,6 +1990,8 @@ els.judgeNow.addEventListener('click', runJudgeNow);
 els.judge.addEventListener('click', runJudge);
 els.push.addEventListener('click', runPush);
 els.reset.addEventListener('click', resetCapture);
+if (els.hcafeRun) els.hcafeRun.addEventListener('click', startHcafeRun);
+if (els.hcafeStop) els.hcafeStop.addEventListener('click', stopHcafeRun);
 
 els.decisionsList.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-toggle-jobid]');

@@ -215,30 +215,43 @@ chrome.runtime.onConnect.addListener((port) => {
     }
 });
 
-// Toolbar-icon click → toggle the in-page panel on the active JR tab.
-// Mirrors jobTODashboard pattern (panel = an iframe injected into the
-// page DOM by the content script, not Chrome's native side panel).
+// Toolbar-icon click → toggle the in-page panel on the active supported tab.
+// Supported hosts: jobright.ai + hiring.cafe. Each host has its own content
+// script (content-scrape.js / content-scrape-hcafe.js). When the icon is
+// clicked on an unsupported tab, default to jobright.ai (legacy behavior).
+const JR_HOST_RX = /^https?:\/\/([^/]+\.)?jobright\.ai\//i;
+const HCAFE_HOST_RX = /^https?:\/\/([^/]+\.)?hiring\.cafe\//i;
+
+function detectSiteFromUrl(url) {
+    if (!url) return null;
+    if (JR_HOST_RX.test(url)) return 'jobright';
+    if (HCAFE_HOST_RX.test(url)) return 'hiring.cafe';
+    return null;
+}
+
 chrome.action.onClicked.addListener(async (tab) => {
     if (!tab?.id) return;
     const url = tab.url || '';
-    if (!/^https?:\/\/([^/]+\.)?jobright\.ai\//.test(url)) {
-        // Not on a JR tab — open one and let the content script auto-mount.
+    const site = detectSiteFromUrl(url);
+    if (!site) {
+        // Not on a supported tab — open JR by default (operator's primary site).
         await chrome.tabs.create({ url: 'https://jobright.ai/jobs/recommend' });
         return;
     }
+    const contentFile = site === 'hiring.cafe' ? 'content-scrape-hcafe.js' : 'content-scrape.js';
     try {
         await chrome.tabs.sendMessage(tab.id, { type: 'jrd-toggle-panel' });
     } catch {
         // Content script may not be injected yet (tab opened before reload).
-        // Inject it manually then toggle.
+        // Inject the right one for the host, then toggle.
         try {
             await chrome.scripting.executeScript({
                 target: { tabId: tab.id },
-                files: ['content-scrape.js'],
+                files: [contentFile],
             });
             await chrome.tabs.sendMessage(tab.id, { type: 'jrd-toggle-panel' });
         } catch (e) {
-            console.warn('[FF-JRD] could not inject content script', e?.message);
+            console.warn('[FF-JRD] could not inject content script', contentFile, e?.message);
         }
     }
 });
@@ -266,6 +279,45 @@ chrome.storage.onChanged.addListener((changes, area) => {
         }
     }
 });
+
+// Authoritative capture-state broadcaster. Every Start / Stop / Reset
+// transition MUST call this so content scripts (JR + hiring.cafe) sync to
+// the SW's truth. Without it, content scripts hold stale flags and either
+// drop jobs (active=true cached but SW says off → SW silently drops) or
+// fail to replay (active=false cached but SW says on → never emits cache).
+//
+// `kind` semantics:
+//   'start' → flush seen + cache, then replay pageCache, then re-scrape
+//   'stop'  → drop emissions but keep buffers (so resume can recover)
+//   'reset' → wipe seen + pageCache + lastCapturedPage; nothing in flight
+function broadcastCaptureState(kind) {
+    const payload = {
+        type: 'jrd-capture-state',
+        kind, // 'start' | 'stop' | 'reset'
+        active: state.capture.active === true,
+        startedAt: state.capture.startedAt || null,
+        sessionId: state.capture.sessionId || '',
+        broadcastAt: Date.now(),
+    };
+    try {
+        chrome.tabs
+            .query({
+                url: [
+                    'https://jobright.ai/*',
+                    'https://*.jobright.ai/*',
+                    'https://hiring.cafe/*',
+                    'https://*.hiring.cafe/*',
+                ],
+            })
+            .then((tabs) => {
+                for (const t of tabs) {
+                    if (!t.id) continue;
+                    chrome.tabs.sendMessage(t.id, payload).catch(() => {});
+                }
+            })
+            .catch(() => {});
+    } catch {}
+}
 
 function setBadge(count) {
     try {
@@ -921,6 +973,12 @@ async function resolveViaScraper(jobId) {
 //        | { ok:false, error, message }
 async function resolveJobDetail(jobId) {
     if (!jobId) return { ok: false, error: 'BAD_INPUT' };
+    // Non-JR job IDs (hiring.cafe composite "<source>___<board>___<orig>")
+    // never resolve through the JR scraper backend — short-circuit so the
+    // caller falls back to the description we already composed locally.
+    if (!/^[a-f0-9]{24}$/i.test(jobId)) {
+        return { ok: false, error: 'NON_JR_JOB_ID', message: 'jobId not in JR format; using local description' };
+    }
     if (applyLinkCache.has(jobId)) {
         const cached = applyLinkCache.get(jobId);
         if (typeof cached === 'object' && cached.applyLink && cached.description) {
@@ -1154,13 +1212,16 @@ over PICK for safety.
 
 POSTING AGE — HARD 48-HOUR CUTOFF. Each job has a "publishedAt" field
 (a relative string like "5 hours ago", "2 days ago", "1 week ago",
-"30+ days ago"). If the posting is OLDER than 48 hours, you MUST set
-pick=false with skipKind="other" and the reason MUST cite the age
-("Skip — posted 2 days ago, older than the 48-hour window."). Treat
+"30+ days ago"). The host extension already deterministically drops
+jobs older than 48 hours and jobs with empty/unparseable publishedAt
+BEFORE you see them — so every job in "Jobs to judge" is in scope by
+age. You still MUST honor the rule as a defense-in-depth: if you see
 anything saying days/weeks/months ago (except "1 day ago" or "today"
-or "X hours ago" where X <= 48) as older than 48 hours. "Yesterday"
-and "1 day ago" are IN scope. When publishedAt is empty or unparseable,
-do NOT skip on age — judge on the other signals.
+or "X hours ago" where X <= 48), set pick=false with skipKind="other"
+and cite the age in the reason ("Skip — posted 2 days ago, older than
+the 48-hour window."). "Yesterday" and "1 day ago" are IN scope.
+Empty publishedAt will never reach you — but if it does, SKIP with
+skipKind="other" rather than picking blind.
 
 Each job in "Jobs to judge" includes a "jd" field — the FULL composed
 job description (responsibilities + must-haves + nice-to-haves + skills
@@ -1453,7 +1514,61 @@ async function resolvePreJudge(jobs, { concurrency = 5 } = {}) {
     return { resolved, fallback };
 }
 
-async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
+// Deterministic posting-age classifier. Returns { ok, kind, label }.
+//   ok=true  → within 48h window, eligible for AI judging
+//   ok=false → either too old or unknown; the AI never sees these jobs
+// We trust this over the model because publishedAt strings are short,
+// the patterns are stable, and we want a single source of truth on age.
+function classifyPostingAge(input) {
+    // Numeric millis path — hiring.cafe gives `estimated_publish_date_millis`
+    // direct from Algolia. Compute hours-since-now and classify same way.
+    if (typeof input === 'number' && Number.isFinite(input) && input > 0) {
+        const ageHours = (Date.now() - input) / 3_600_000;
+        if (ageHours < 0) {
+            // Future timestamp — treat as fresh (clock skew).
+            return { ok: true, kind: 'within-48h', label: `${new Date(input).toISOString()}` };
+        }
+        if (ageHours <= 48) {
+            return { ok: true, kind: 'within-48h', label: `${Math.round(ageHours)}h ago` };
+        }
+        return { ok: false, kind: 'stale', label: `${Math.round(ageHours / 24)}d ago` };
+    }
+    const raw = typeof input === 'string' ? input.trim() : '';
+    if (!raw) return { ok: false, kind: 'unknown', label: '' };
+    const t = raw.toLowerCase().replace(/^posted\s+/, '');
+    // Within window: today / just now / minutes / seconds.
+    if (/(just\s*now|just\s*posted|moments?\s*ago|today)/.test(t)) {
+        return { ok: true, kind: 'within-48h', label: raw };
+    }
+    // Hours pattern — strict X <= 48.
+    const hm = t.match(/^(\d+)\s*\+?\s*(hour|hr|h)s?\b/);
+    if (hm) {
+        const n = Number(hm[1]);
+        return n <= 48
+            ? { ok: true, kind: 'within-48h', label: raw }
+            : { ok: false, kind: 'stale', label: raw };
+    }
+    // Minutes / seconds — always in window.
+    if (/^\d+\s*\+?\s*(minute|min|m|second|sec|s)s?\b/.test(t)) {
+        return { ok: true, kind: 'within-48h', label: raw };
+    }
+    // Yesterday / 1 day ago = ~24h, just inside the 48h window.
+    if (/^yesterday\b/.test(t)) return { ok: true, kind: 'within-48h', label: raw };
+    const dm = t.match(/^(\d+)\s*\+?\s*(day|week|month|year)s?\s*ago\b/);
+    if (dm) {
+        const n = Number(dm[1]);
+        const unit = dm[2];
+        if (unit === 'day' && n <= 1) return { ok: true, kind: 'within-48h', label: raw };
+        return { ok: false, kind: 'stale', label: raw };
+    }
+    // Bare unit (no "ago") — "30+ days", "2 weeks", treat as stale.
+    if (/\b(day|week|month|year)s?\b/.test(t) && /\d/.test(t)) {
+        return { ok: false, kind: 'stale', label: raw };
+    }
+    return { ok: false, kind: 'unknown', label: raw };
+}
+
+async function aiJudge({ profile, jobs, threshold, aiSummary = '', skipAgeGate = false }) {
     if (!state.config.openaiKey) return { ok: false, error: 'NO_OPENAI_KEY' };
     if (!jobs.length) return { ok: true, decisions: [] };
 
@@ -1788,6 +1903,28 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
         };
     }
 
+    // Deterministic posting-age gate. Run BEFORE batching so stale jobs
+    // never reach the AI — saves tokens AND closes the model loophole where
+    // empty/unparseable publishedAt strings were allowed through.
+    //
+    // skipAgeGate: hiring.cafe runs already constrain recency server-side
+    // via `dateFetchedPastNDays` (the operator's "Past 24 hours" filter).
+    // hiring.cafe's `estimated_publish_date` is the ORIGINAL posting date —
+    // often weeks old even for a job freshly indexed in the last 24h — so
+    // applying the 48h publish-date gate here would wrongly drop the whole
+    // page. The fetch-recency filter is the authority for that source.
+    const ageEligible = [];
+    const ageStale = [];
+    if (skipAgeGate) {
+        ageEligible.push(...jobs);
+    } else {
+        for (const j of jobs) {
+            const age = classifyPostingAge(j.publishedAt);
+            if (age.ok) ageEligible.push(j);
+            else ageStale.push({ job: j, age });
+        }
+    }
+
     // Batch in chunks of 8 — matches DEFAULTS.autoBatchSize so a single
     // auto-batch trigger maps to ONE OpenAI call (no internal split).
     // 8 jobs × 4500 char JDs ≈ 9k input tokens — still under gpt-4o-mini's
@@ -1795,9 +1932,33 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
     const BATCH = 8;
     const decisions = [];
     const jobsById = new Map(jobs.map((j) => [j.jobId, j]));
-    const totalBatches = Math.ceil(jobs.length / BATCH);
-    for (let i = 0; i < jobs.length; i += BATCH) {
-        const batch = jobs.slice(i, i + BATCH);
+
+    // Emit synthesized skip decisions for age-stale + age-unknown jobs.
+    for (const { job, age } of ageStale) {
+        const reason = age.kind === 'stale'
+            ? `Skip — posted "${age.label}", older than the 48-hour scrape window.`
+            : `Skip — posting age unknown (${age.label ? `"${age.label}"` : 'empty'}); strict 48h policy rejects unknown ages.`;
+        const synth = {
+            id: job.jobId,
+            pick: false,
+            score: 0,
+            reason,
+            matchedRole: '',
+            skipKind: 'other',
+        };
+        decisions.push(synth);
+        notifyPopup('decision', { decision: synth, job });
+    }
+    if (ageStale.length) {
+        console.log('[FF-JRD] age-gate: dropped', ageStale.length, '/', jobs.length, 'jobs (stale or unknown publishedAt)');
+    }
+    if (ageEligible.length === 0) {
+        return { ok: true, decisions };
+    }
+
+    const totalBatches = Math.ceil(ageEligible.length / BATCH);
+    for (let i = 0; i < ageEligible.length; i += BATCH) {
+        const batch = ageEligible.slice(i, i + BATCH);
         const batchIndex = Math.floor(i / BATCH) + 1;
         notifyPopup('ai-batch-start', {
             batchIndex,
@@ -1843,6 +2004,9 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
         const VALID_SKIP_KINDS = new Set([
             'threshold', 'role-mismatch', 'seniority-mismatch',
             'location-mismatch', 'auth-mismatch', 'company-blocked',
+            // 'other' covers posting-age skips + employment-type mismatches +
+            // any other deterministic veto that doesn't fit the standard buckets.
+            'other',
         ]);
         for (const d of parsed.decisions) {
             const skipKindRaw = typeof d.skipKind === 'string' ? d.skipKind.trim() : '';
@@ -2031,7 +2195,7 @@ async function autoPushOne(job, decision) {
 
 // runAutoBatch: judge a slice → for picks, resolve+push in parallel.
 // Updates state.judged so manual UI keeps a usable history.
-async function runAutoBatch(batch) {
+async function runAutoBatch(batch, opts = {}) {
     if (state.auto.running) return state.auto.runningPromise;
     state.auto.running = true;
     let resolveRunning;
@@ -2060,6 +2224,7 @@ async function runAutoBatch(batch) {
             jobs: batch,
             threshold: state.config.aiThreshold ?? 50,
             aiSummary: ctx.aiSummary,
+            skipAgeGate: opts.skipAgeGate === true,
         });
         if (!judge.ok) {
             console.warn('[FF-JRD] auto: aiJudge failed', judge.error, judge.message);
@@ -2197,6 +2362,344 @@ async function flushAutoBatch() {
         await runAutoBatch(pending);
         // After runAutoBatch, runningPromise is cleared; if more captures
         // arrived during the run, the next iteration picks them up.
+    }
+}
+
+// ===========================================================================
+// hiring.cafe — backend API scrape
+// ===========================================================================
+//
+// hiring.cafe is a Next.js app. Its own frontend loads jobs from a JSON data
+// endpoint; we call that endpoint directly from the service worker (which has
+// host_permissions for hiring.cafe, so no CORS barrier). No DOM scraping, no
+// content-script capture — the operator just sets filters in the panel and
+// the SW fetches page by page, normalises, judges (same AI judge), and pushes.
+//
+//   GET https://hiring.cafe/_next/data/<buildId>/index.json
+//       ?searchState=<urlencoded JSON>&page=<N>
+//
+// searchState keys we drive:
+//   searchQuery           role / keyword string
+//   locations             [<country object>] — country-scoped search
+//   dateFetchedPastNDays  2  → operator's "Past 24 hours" filter
+//
+// Response: pageProps.ssrHits[] (~120 jobs/page), ssrIsLastPage, ssrTotalCount.
+
+// Rough country centroids — hiring.cafe's location object carries a geometry
+// block. An exact point isn't needed for a country-level filter (the match is
+// by address_components + flexible_regions) but we send a plausible centroid.
+const HCAFE_COUNTRY_GEO = {
+    US: { lat: 37.0902, lon: -95.7129 },
+    CA: { lat: 56.1304, lon: -106.3468 },
+    GB: { lat: 55.3781, lon: -3.4360 },
+    IN: { lat: 20.5937, lon: 78.9629 },
+    DE: { lat: 51.1657, lon: 10.4515 },
+    AU: { lat: -25.2744, lon: 133.7751 },
+    SG: { lat: 1.3521, lon: 103.8198 },
+    NL: { lat: 52.1326, lon: 5.2913 },
+    IE: { lat: 53.1424, lon: -7.6921 },
+    FR: { lat: 46.2276, lon: 2.2137 },
+    AE: { lat: 23.4241, lon: 53.8478 },
+    NZ: { lat: -40.9006, lon: 174.8860 },
+};
+
+// buildHcafeCountry: turn a {name, code} pair into the Places-shaped object
+// hiring.cafe expects inside searchState.locations[].
+function buildHcafeCountry(country) {
+    const code = String(country?.code || '').toUpperCase();
+    const name = String(country?.name || '').trim();
+    if (!code || !name) return null;
+    return {
+        formatted_address: name,
+        types: ['country'],
+        geometry: { location: HCAFE_COUNTRY_GEO[code] || { lat: 0, lon: 0 } },
+        id: `${code.toLowerCase()}_country`,
+        address_components: [{ long_name: name, short_name: code, types: ['country'] }],
+        options: { flexible_regions: ['anywhere_in_continent', 'anywhere_in_world'] },
+    };
+}
+
+// resolveHcafeTab: find a hiring.cafe tab to proxy fetches through.
+// hiring.cafe is behind Cloudflare — a cold SW fetch gets 403'd — so the
+// actual request runs in the page (which holds the cf_clearance cookie).
+// Prefers the tab the panel run was started from; falls back to any open
+// hiring.cafe tab.
+async function resolveHcafeTab(preferTabId) {
+    if (preferTabId) {
+        try {
+            const t = await chrome.tabs.get(preferTabId);
+            if (t && HCAFE_HOST_RX.test(t.url || '')) return t.id;
+        } catch { /* tab gone — fall through */ }
+    }
+    try {
+        const tabs = await chrome.tabs.query({
+            url: ['https://hiring.cafe/*', 'https://*.hiring.cafe/*'],
+        });
+        const active = tabs.find((t) => t.active) || tabs[0];
+        return active?.id || null;
+    } catch {
+        return null;
+    }
+}
+
+// fetchHcafePage: ask the hiring.cafe content script to perform one
+// same-origin fetch of the data endpoint. Returns { hits, isLastPage,
+// total } or { error }.
+async function fetchHcafePage(tabId, searchState, page) {
+    if (!tabId) return { error: 'NO_TAB' };
+    try {
+        // frameId:0 → deliver only to the top-frame content script, not the
+        // extension panel iframe (which also listens for runtime messages).
+        const r = await chrome.tabs.sendMessage(tabId, {
+            type: 'hcafe-fetch',
+            searchState,
+            page,
+        }, { frameId: 0 });
+        if (!r) return { error: 'NO_RESPONSE' };
+        if (r.error) return { error: r.error, message: r.message };
+        return {
+            hits: Array.isArray(r.hits) ? r.hits : [],
+            isLastPage: !!r.isLastPage,
+            total: r.total || 0,
+            page,
+        };
+    } catch (e) {
+        return { error: 'TAB_CHANNEL', message: e?.message || String(e) };
+    }
+}
+
+// ---- hiring.cafe hit → canonical Job normaliser --------------------------
+//
+// Mirrors the field map the JR pipeline + dashboard expect. hiring.cafe list
+// payloads are fully hydrated (v5_processed_job_data) — no detail fetch.
+
+function hcafePickTitle(hit) {
+    const ji = hit.job_information || {};
+    const v5 = hit.v5_processed_job_data || {};
+    return (
+        (ji.title && String(ji.title).trim())
+        || (v5.core_job_title && String(v5.core_job_title).trim())
+        || (ji.job_title_raw && String(ji.job_title_raw).trim())
+        || ''
+    );
+}
+
+function hcafePickCompany(hit) {
+    const ecd = hit.enriched_company_data || {};
+    const v5 = hit.v5_processed_job_data || {};
+    return (
+        (ecd.name && String(ecd.name).trim())
+        || (v5.company_name && String(v5.company_name).trim())
+        || ''
+    );
+}
+
+function hcafePickLocation(hit) {
+    const v5 = hit.v5_processed_job_data || {};
+    if (v5.formatted_workplace_location) return String(v5.formatted_workplace_location).trim();
+    const parts = [
+        ...(v5.workplace_cities || []),
+        ...(v5.workplace_states || []),
+        ...(v5.workplace_countries || []),
+    ].filter(Boolean);
+    return parts.join(', ');
+}
+
+function hcafePickSalary(hit) {
+    const v5 = hit.v5_processed_job_data || {};
+    const cur = v5.listed_compensation_currency || 'USD';
+    const min = v5.yearly_min_compensation;
+    const max = v5.yearly_max_compensation;
+    if (min && max) return `${cur} ${Math.round(min).toLocaleString()}–${Math.round(max).toLocaleString()}/yr`;
+    if (min) return `${cur} ${Math.round(min).toLocaleString()}/yr`;
+    if (max) return `${cur} up to ${Math.round(max).toLocaleString()}/yr`;
+    return '';
+}
+
+function hcafePickTags(hit) {
+    const v5 = hit.v5_processed_job_data || {};
+    const tags = [];
+    if (v5.visa_sponsorship === true) tags.push('Visa Sponsor');
+    if (v5.visa_sponsorship === false) tags.push('No Sponsorship');
+    if (v5.security_clearance && v5.security_clearance !== 'None') tags.push('Clearance Required');
+    if (v5.relocation_assistance) tags.push('Relocation');
+    if (v5.four_day_work_week) tags.push('4-Day Week');
+    return tags;
+}
+
+function hcafeComposeDescription(hit) {
+    const parts = [];
+    const title = hcafePickTitle(hit);
+    const company = hcafePickCompany(hit);
+    const ecd = hit.enriched_company_data || {};
+    const v5 = hit.v5_processed_job_data || {};
+    const ji = hit.job_information || {};
+    if (title && company) parts.push(`${title} at ${company}`);
+    if (ecd.tagline) parts.push(`Company: ${String(ecd.tagline).trim()}`);
+    const reqs = (v5.requirements_summary || '').trim();
+    if (reqs) parts.push(`Requirements:\n${reqs}`);
+    const acts = Array.isArray(v5.role_activities) ? v5.role_activities.filter(Boolean) : [];
+    if (acts.length) parts.push(`Role activities:\n${acts.map((a) => `• ${a}`).join('\n')}`);
+    const tools = Array.isArray(v5.technical_tools) ? v5.technical_tools.filter(Boolean) : [];
+    if (tools.length) parts.push(`Tools: ${tools.join(', ')}`);
+    const langs = Array.isArray(v5.language_requirements) ? v5.language_requirements.filter(Boolean) : [];
+    if (langs.length) parts.push(`Languages: ${langs.join(', ')}`);
+    const metaBits = [];
+    if (v5.seniority_level) metaBits.push(`Seniority: ${v5.seniority_level}`);
+    if (Array.isArray(v5.commitment) && v5.commitment.length) metaBits.push(`Commitment: ${v5.commitment.join(', ')}`);
+    if (v5.workplace_type) metaBits.push(`Workplace: ${v5.workplace_type}`);
+    const loc = hcafePickLocation(hit);
+    if (loc) metaBits.push(`Location: ${loc}`);
+    const sal = hcafePickSalary(hit);
+    if (sal) metaBits.push(`Comp: ${sal}`);
+    if (typeof v5.min_industry_and_role_yoe === 'number' && v5.min_industry_and_role_yoe > 0) {
+        metaBits.push(`Min experience: ${v5.min_industry_and_role_yoe}+ yrs`);
+    }
+    if (metaBits.length) parts.push(metaBits.join(' | '));
+    const rawDesc = (ji.description || '').trim();
+    if (rawDesc && rawDesc.length > 80) parts.push(`Description:\n${rawDesc.slice(0, 5000)}`);
+    return parts.join('\n\n').trim();
+}
+
+function normalizeHcafeHit(hit) {
+    if (!hit || !hit.id) return null;
+    if (hit.is_expired === true) return null;
+    const title = hcafePickTitle(hit);
+    const company = hcafePickCompany(hit);
+    const applyUrl = (hit.apply_url && String(hit.apply_url).trim()) || '';
+    if (!title || !company || !applyUrl) return null;
+
+    const v5 = hit.v5_processed_job_data || {};
+    const ecd = hit.enriched_company_data || {};
+    const publishedMillis =
+        typeof v5.estimated_publish_date_millis === 'number'
+            ? v5.estimated_publish_date_millis
+            : (v5.estimated_publish_date ? Date.parse(v5.estimated_publish_date) : 0);
+    const inds = Array.isArray(ecd.industries) ? ecd.industries.filter(Boolean) : [];
+
+    return {
+        jobId: String(hit.id),
+        site: 'hiring.cafe',
+        title,
+        company,
+        industries: inds.length ? inds.join(', ') : (ecd.tagline ? String(ecd.tagline).trim() : ''),
+        location: hcafePickLocation(hit),
+        employmentType: Array.isArray(v5.commitment) ? v5.commitment.join(', ') : (v5.commitment || ''),
+        salary: hcafePickSalary(hit),
+        workModel: v5.workplace_type || '',
+        seniority: v5.seniority_level || '',
+        experienceYears:
+            (typeof v5.min_industry_and_role_yoe === 'number' && v5.min_industry_and_role_yoe > 0)
+                ? `${v5.min_industry_and_role_yoe}+ years`
+                : '',
+        publishedAt: publishedMillis || '',
+        matchPercent: 0,
+        matchSummary: (v5.requirements_summary || '').slice(0, 600),
+        fitFlag: '',
+        tags: hcafePickTags(hit),
+        applyUrl,
+        jrLink: `https://hiring.cafe/job/${encodeURIComponent(String(hit.id))}`,
+        description: hcafeComposeDescription(hit),
+        capturedAt: new Date().toISOString(),
+    };
+}
+
+// runHcafeFetch: the page-by-page scrape loop. Each page is normalised then
+// fed straight into runAutoBatch (same judge + resolve + push pipeline the JR
+// flow uses), so picks land in the dashboard respecting the client cap.
+let hcafeRunActive = false;
+// Generation counter. Every Start increments it; the running loop captures
+// its own gen and bails the moment the global gen moves on. This makes Start
+// always supersede a prior run and makes Stop an instant, race-free kill —
+// even if the old loop is wedged mid-await.
+let hcafeRunGen = 0;
+
+async function runHcafeFetch(filters, preferTabId) {
+    const myGen = ++hcafeRunGen;
+    hcafeRunActive = true;
+    const searchState = {};
+    const sq = String(filters?.searchQuery || '').trim();
+    if (sq) searchState.searchQuery = sq;
+    if (filters?.country && filters.country.code) {
+        const loc = buildHcafeCountry(filters.country);
+        if (loc) searchState.locations = [loc];
+    }
+    if (filters?.past24) searchState.dateFetchedPastNDays = 2;
+    const maxPages = Math.min(Math.max(Number(filters?.maxPages) || 5, 1), 50);
+
+    notifyPopup('hcafe-phase', { phase: 'start', maxPages });
+    const tabId = await resolveHcafeTab(preferTabId);
+    if (hcafeRunGen !== myGen) return; // superseded / stopped while resolving
+    if (!tabId) {
+        hcafeRunActive = false;
+        state.capture.active = false;
+        notifyPopup('hcafe-done', { error: 'NO_TAB' });
+        return;
+    }
+
+    const seenIds = new Set();
+    let pagesDone = 0;
+    let scraped = 0;
+    let stopReason = 'maxPages';
+
+    for (let page = 0; page < maxPages; page += 1) {
+        if (hcafeRunGen !== myGen) { stopReason = 'superseded'; break; }
+        if (!state.capture.active) { stopReason = 'stopped'; break; }
+        if (state.auto.capHit) { stopReason = 'capHit'; break; }
+
+        const res = await fetchHcafePage(tabId, searchState, page);
+        if (hcafeRunGen !== myGen) { stopReason = 'superseded'; break; }
+        if (res.error) {
+            notifyPopup('hcafe-phase', { phase: 'page-error', page, error: res.error, message: res.message });
+            stopReason = `error:${res.error}`;
+            break;
+        }
+        pagesDone += 1;
+
+        const normalized = res.hits.map(normalizeHcafeHit).filter(Boolean);
+        const fresh = [];
+        for (const j of normalized) {
+            if (seenIds.has(j.jobId)) continue;
+            seenIds.add(j.jobId);
+            fresh.push(j);
+        }
+        scraped += fresh.length;
+        if (fresh.length) {
+            bumpToday('captures', fresh.length);
+            scheduleSessionHeartbeat();
+        }
+        notifyPopup('hcafe-page', {
+            page,
+            total: res.total,
+            fetched: res.hits.length,
+            fresh: fresh.length,
+            scraped,
+        });
+
+        if (fresh.length && hcafeRunGen === myGen) {
+            // Same pipeline as JR — judge + resolve + push. skipAgeGate:true
+            // because hiring.cafe's date filter already governs recency.
+            await runAutoBatch(fresh, { skipAgeGate: true });
+        }
+
+        if (res.isLastPage) { stopReason = 'lastPage'; break; }
+        await new Promise((r) => setTimeout(r, 700)); // be polite between pages
+    }
+
+    // Only the CURRENT generation owns the global flags — a superseded loop
+    // must not clobber the run that replaced it.
+    if (hcafeRunGen === myGen) {
+        hcafeRunActive = false;
+        state.capture.active = false;
+        reportSessionStat('hcafe-done').catch(() => {});
+        notifyPopup('hcafe-done', {
+            pages: pagesDone,
+            scraped,
+            reason: stopReason,
+            stats: { ...state.auto.stats },
+        });
+    } else {
+        console.log('[FF-HCAFE] run gen', myGen, 'ended (superseded by', hcafeRunGen, ')');
     }
 }
 
@@ -2655,18 +3158,11 @@ function dispatchMessage(msg, _sender, sendResponse) {
         setBadge(0);
         persistCapture();
         chrome.storage.session.remove(PERSIST_KEYS.judged).catch(() => {});
-        // Tell content script to clear its in-page cache so a re-scroll
-        // re-emits cards instead of the de-dup squelching them.
-        chrome.tabs
-            .query({ url: ['https://jobright.ai/*', 'https://*.jobright.ai/*'] })
-            .then((tabs) => {
-                for (const t of tabs) {
-                    chrome.tabs
-                        .sendMessage(t.id, { type: 'jrd-reset-content-cache' })
-                        .catch(() => {});
-                }
-            })
-            .catch(() => {});
+        // Single authoritative state broadcast — content scripts on JR and
+        // hiring.cafe both pick this up. Kind='start' → clear seen + replay
+        // any buffered hits + re-scrape current page so the operator's
+        // first batch lands without making them re-scroll.
+        broadcastCaptureState('start');
         sendResponse({ ok: true });
         return true;
     }
@@ -2679,6 +3175,7 @@ function dispatchMessage(msg, _sender, sendResponse) {
         flushAutoBatch()
             .catch(() => {})
             .finally(() => reportSessionStat('stop'));
+        broadcastCaptureState('stop');
         sendResponse({ ok: true, count: state.capture.jobs.size });
         return true;
     }
@@ -2705,8 +3202,52 @@ function dispatchMessage(msg, _sender, sendResponse) {
         state.auto.stats = { judged: 0, picks: 0, pushed: 0, dupes: 0, blocked: 0, errors: 0, skipsByKind: {} };
         setBadge(0);
         chrome.storage.session.remove(Object.values(PERSIST_KEYS)).catch(() => {});
+        // Tell content scripts to wipe THEIR caches too — otherwise after
+        // Reset their `seen` Set + `pageCache` carry old IDs and the next
+        // Start re-emits already-pushed jobs as duplicates or skips fresh
+        // hits as "seen".
+        broadcastCaptureState('reset');
         sendResponse({ ok: true });
         return true;
+    }
+
+    if (msg.type === 'jrd-broadcast-health') {
+        // Probe every supported tab's content script. Each one answers
+        // `jrd-content-stats` synchronously. Used by the sidepanel right
+        // after Start to verify the scraping tab is actually alive.
+        (async () => {
+            const tabs = await chrome.tabs.query({
+                url: [
+                    'https://jobright.ai/*',
+                    'https://*.jobright.ai/*',
+                    'https://hiring.cafe/*',
+                    'https://*.hiring.cafe/*',
+                ],
+            }).catch(() => []);
+            const results = await Promise.all(
+                tabs.map(async (t) => {
+                    if (!t.id) return null;
+                    let host = '';
+                    try { host = new URL(t.url || '').host; } catch {}
+                    try {
+                        const reply = await chrome.tabs.sendMessage(t.id, { type: 'jrd-content-stats' });
+                        return {
+                            tabId: t.id,
+                            host,
+                            url: t.url,
+                            alive: !!reply,
+                            captureActive: reply?.captureActive,
+                            seen: reply?.seen ?? 0,
+                            cachedPages: reply?.cachedPages || [],
+                        };
+                    } catch (e) {
+                        return { tabId: t.id, host, url: t.url, alive: false, error: e?.message || 'no-response' };
+                    }
+                }),
+            );
+            sendResponse({ ok: true, tabs: results.filter(Boolean) });
+        })();
+        return true; // async
     }
 
     if (msg.type === 'jrd-flush-auto') {
@@ -2749,5 +3290,81 @@ function dispatchMessage(msg, _sender, sendResponse) {
         return true;
     }
 
+    if (msg.type === 'jrd-hcafe-start') {
+        console.log('[FF-HCAFE] jrd-hcafe-start received — filters:', msg.filters);
+        if (state.auto.capHit) {
+            sendResponse({
+                ok: false,
+                error: 'CAP_HIT',
+                message: 'Client target reached — raise the cap in Clients-Tracking → AI Summary, then run again.',
+                capInfo: state.auto.capInfo,
+            });
+            return true;
+        }
+        // A new Start always supersedes any prior run — the generation
+        // counter inside runHcafeFetch makes the old loop bail on its next
+        // checkpoint, so no ALREADY_RUNNING refusal is needed.
+        // Fresh session — mirror jrd-start-capture's reset so stats + judged
+        // history start clean for this run.
+        state.capture.active = true;
+        state.capture.startedAt = new Date().toISOString();
+        state.capture.sessionId =
+            (crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+        state.capture.jobs = new Map();
+        state.capture.linkedinSkipped = new Map();
+        state.judged = null;
+        state.auto.processed = new Set();
+        state.auto.profile = null;
+        state.auto.aiSummary = '';
+        state.auto.stats = { judged: 0, picks: 0, pushed: 0, dupes: 0, blocked: 0, errors: 0, skipsByKind: {} };
+        setBadge(0);
+        chrome.storage.session.remove(PERSIST_KEYS.judged).catch(() => {});
+        // The panel iframe lives inside the hiring.cafe tab — _sender.tab is
+        // that tab. The SW proxies API fetches through it (Cloudflare).
+        const hcafeTabId = _sender?.tab?.id || null;
+        runHcafeFetch(msg.filters || {}, hcafeTabId).catch((e) => {
+            hcafeRunActive = false;
+            state.capture.active = false;
+            console.warn('[FF-HCAFE] runHcafeFetch threw:', e?.message);
+            notifyPopup('hcafe-done', { error: 'THREW', message: e?.message || String(e) });
+        });
+        sendResponse({ ok: true });
+        return true;
+    }
+
+    if (msg.type === 'jrd-hcafe-stop') {
+        // Hard kill — stops the scrape loop AND the judge pipeline, even if
+        // a prior run is wedged. Bumping the generation invalidates any loop
+        // still in flight; it bails at its next checkpoint without touching
+        // global state. We also force-clear the auto-pipeline flags so a
+        // stuck judge batch can't keep the panel locked.
+        hcafeRunGen += 1;
+        hcafeRunActive = false;
+        state.capture.active = false;
+        state.auto.running = false;
+        state.auto.runningPromise = null;
+        console.log('[FF-HCAFE] hard stop — gen bumped to', hcafeRunGen);
+        notifyPopup('hcafe-done', {
+            pages: 0,
+            scraped: 0,
+            reason: 'stopped',
+            stats: { ...state.auto.stats },
+        });
+        sendResponse({ ok: true });
+        return true;
+    }
+
+    // Unknown message type. Always respond — otherwise Chrome closes the
+    // port with "message port closed before a response was received", which
+    // the panel can't tell apart from a dead SW. An UNKNOWN_MESSAGE reply
+    // means: this SW build predates the message (reload the extension).
+    console.warn('[FF-JRD] dispatchMessage: no handler for message type', msg.type);
+    try {
+        sendResponse({
+            ok: false,
+            error: 'UNKNOWN_MESSAGE',
+            message: `Service worker has no handler for "${msg.type}". The running SW is an older build — reload the extension at chrome://extensions.`,
+        });
+    } catch {}
     return false;
 }
