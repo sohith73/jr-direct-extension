@@ -1568,6 +1568,116 @@ function classifyPostingAge(input) {
     return { ok: false, kind: 'unknown', label: raw };
 }
 
+// ---- US-citizenship / clearance gate -------------------------------------
+//
+// Operator rule: a job that requires US citizenship or a US security
+// clearance is only eligible when the client's work authorization is
+// literally "US Citizen". Every other status (Green Card, H1B, OPT, F1,
+// needs sponsorship, …) → such jobs are dropped before the AI judges them.
+
+// clientIsUSCitizen: true ONLY when work auth resolves to US citizen.
+// Green Card / permanent resident does NOT count (per the operator rule).
+function clientIsUSCitizen(profile) {
+    const raw = String(profile?.usWorkEligibility || profile?.visaStatus || '')
+        .toLowerCase().trim();
+    if (!raw) return false;
+    if (/\bnot\b|non[-\s]?citizen/.test(raw)) return false; // "not a citizen"
+    if (/green\s*card|permanent\s*resident|\bgc\b/.test(raw)) return false;
+    return /citizen|\bus[cn]\b/.test(raw);
+}
+
+// jobRequiresUSCitizen: true when the job needs US citizenship or a US
+// security clearance. Tags are the most reliable signal; description text
+// is the fallback (with a guard so "no clearance required" doesn't trip it).
+const FF_USC_TEXT_RX = /\b(?:u\.?\s?s\.?\s*citizen(?:ship)?|must\s+be\s+a\s+(?:u\.?\s?s\.?\s+)?citizen|citizenship\s+(?:is\s+)?required|sole\s+u\.?\s?s\.?\s+citizen)\b/i;
+const FF_CLEARANCE_RX = /\b(?:security\s+clearance|active\s+clearance|ts\/sci|top\s+secret|secret\s+clearance|public\s+trust\s+clearance|polygraph|dod\s+(?:secret|clearance))\b/i;
+const FF_NEG_CLEARANCE_RX = /\b(?:no|not|without|don'?t|doesn'?t|isn'?t|never|n[o']t\s+require)\b[^.\n]{0,40}\bclearance\b/i;
+function jobRequiresUSCitizen(job) {
+    const tags = Array.isArray(job?.tags) ? job.tags : [];
+    for (const t of tags) {
+        const s = String(t || '').toLowerCase();
+        if (s.includes('citizen') || s.includes('clearance')) return true;
+    }
+    const text = `${job?.title || ''}\n${job?.description || ''}\n${job?.matchSummary || ''}`;
+    if (FF_USC_TEXT_RX.test(text)) return true;
+    if (FF_CLEARANCE_RX.test(text) && !FF_NEG_CLEARANCE_RX.test(text)) return true;
+    return false;
+}
+
+// ---- judge model routing -------------------------------------------------
+//
+// Every judge batch is tried on Gemini 2.5 Flash Lite first, via the
+// dashboard backend's /extension/gemini-judge route (the service worker
+// can't run Vertex AI itself). Only when the Gemini call fails — network,
+// Vertex error, or unparseable JSON — does the batch fall back to OpenAI
+// gpt-4o-mini, and the failure is counted so the cost report shows it.
+//
+// GEMINI_JUDGE_FRACTION is the share of batches that ATTEMPT Gemini first.
+// 1 = always Gemini-first (current). Lower it to split traffic.
+const GEMINI_JUDGE_FRACTION = (() => {
+    const n = Number(self.__FF_GEMINI_FRACTION__);
+    return Number.isFinite(n) && n >= 0 && n <= 1 ? n : 1;
+})();
+
+function bumpModelTally(key, n = 1) {
+    if (!state.auto.stats) state.auto.stats = {};
+    state.auto.stats[key] = (state.auto.stats[key] || 0) + n;
+}
+
+// callOpenAiJudge: one judge batch on gpt-4o-mini. Returns { ok, content }.
+async function callOpenAiJudge(system, user) {
+    let res;
+    try {
+        res = await fetch('https://api.openai.com/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                authorization: `Bearer ${state.config.openaiKey}`,
+            },
+            body: JSON.stringify({
+                model: 'gpt-4o-mini',
+                messages: [
+                    { role: 'system', content: system },
+                    { role: 'user', content: user },
+                ],
+                response_format: { type: 'json_object' },
+                temperature: 0,
+            }),
+        });
+    } catch (e) {
+        return { ok: false, error: 'NETWORK', message: e.message };
+    }
+    if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        return { ok: false, error: `OPENAI_${res.status}`, message: txt.slice(0, 400) };
+    }
+    const data = await res.json();
+    return { ok: true, content: data?.choices?.[0]?.message?.content || '{}' };
+}
+
+// callGeminiJudge: one judge batch via the dashboard backend's Vertex AI
+// (Gemini 2.5 Flash Lite) route. Returns { ok:false } on any failure —
+// transport, upstream, or bad JSON — so the caller falls back to OpenAI.
+async function callGeminiJudge(system, user) {
+    const r = await dashboardFetch('/extension/gemini-judge', {
+        method: 'POST',
+        body: JSON.stringify({ system, user, temperature: 0 }),
+    });
+    if (!r.ok || !r.body || r.body.ok !== true || typeof r.body.content !== 'string') {
+        return {
+            ok: false,
+            error: r.body?.error || r.error || 'GEMINI_JUDGE_FAILED',
+            message: r.body?.message || r.errorDetail || '',
+        };
+    }
+    let parsed = null;
+    try { parsed = JSON.parse(r.body.content); } catch { /* ignore */ }
+    if (!parsed || !Array.isArray(parsed.decisions)) {
+        return { ok: false, error: 'GEMINI_BAD_JSON', message: String(r.body.content).slice(0, 300) };
+    }
+    return { ok: true, content: r.body.content };
+}
+
 async function aiJudge({ profile, jobs, threshold, aiSummary = '', skipAgeGate = false }) {
     if (!state.config.openaiKey) return { ok: false, error: 'NO_OPENAI_KEY' };
     if (!jobs.length) return { ok: true, decisions: [] };
@@ -1956,9 +2066,43 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '', skipAgeGate =
         return { ok: true, decisions };
     }
 
-    const totalBatches = Math.ceil(ageEligible.length / BATCH);
-    for (let i = 0; i < ageEligible.length; i += BATCH) {
-        const batch = ageEligible.slice(i, i + BATCH);
+    // Deterministic US-citizenship / clearance gate. When the client is NOT
+    // a US citizen, any job requiring US citizenship or a security clearance
+    // is dropped before the AI sees it — it can never be a fit, and the
+    // operator rule forbids scraping such jobs for non-citizen clients.
+    const clientCitizen = clientIsUSCitizen(profile);
+    const authEligible = [];
+    const authBlocked = [];
+    if (clientCitizen) {
+        authEligible.push(...ageEligible);
+    } else {
+        for (const j of ageEligible) {
+            if (jobRequiresUSCitizen(j)) authBlocked.push(j);
+            else authEligible.push(j);
+        }
+    }
+    for (const job of authBlocked) {
+        const synth = {
+            id: job.jobId,
+            pick: false,
+            score: 0,
+            reason: 'Skip — job requires US citizenship / security clearance; candidate work authorization is not "US Citizen".',
+            matchedRole: '',
+            skipKind: 'auth-mismatch',
+        };
+        decisions.push(synth);
+        notifyPopup('decision', { decision: synth, job });
+    }
+    if (authBlocked.length) {
+        console.log('[FF-JRD] citizen-gate: dropped', authBlocked.length, '/', ageEligible.length, 'US-citizen/clearance jobs (client work-auth not US Citizen)');
+    }
+    if (authEligible.length === 0) {
+        return { ok: true, decisions };
+    }
+
+    const totalBatches = Math.ceil(authEligible.length / BATCH);
+    for (let i = 0; i < authEligible.length; i += BATCH) {
+        const batch = authEligible.slice(i, i + BATCH);
         const batchIndex = Math.floor(i / BATCH) + 1;
         notifyPopup('ai-batch-start', {
             batchIndex,
@@ -1966,40 +2110,35 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '', skipAgeGate =
             batchSize: batch.length,
             jobs: batch.map((j) => ({ jobId: j.jobId, title: j.title, company: j.company })),
         });
-        const body = {
-            // Locked — judging is tuned for gpt-4o-mini's reasoning + cost
-            // profile. Don't read from config; ignore stored override.
-            model: 'gpt-4o-mini',
-            messages: [
-                { role: 'system', content: SYSTEM_PROMPT },
-                { role: 'user', content: buildUserPrompt({ profile, jobs: batch, threshold, aiSummary }) },
-            ],
-            response_format: { type: 'json_object' },
-            temperature: 0,
-        };
-        let res;
-        try {
-            res = await fetch('https://api.openai.com/v1/chat/completions', {
-                method: 'POST',
-                headers: {
-                    'content-type': 'application/json',
-                    authorization: `Bearer ${state.config.openaiKey}`,
-                },
-                body: JSON.stringify(body),
-            });
-        } catch (e) {
-            return { ok: false, error: 'NETWORK', message: e.message };
+        const systemPrompt = SYSTEM_PROMPT;
+        const userPrompt = buildUserPrompt({ profile, jobs: batch, threshold, aiSummary });
+
+        // Gemini 2.5 Flash Lite first (via the dashboard backend). OpenAI
+        // gpt-4o-mini only handles batches where Gemini fails — each such
+        // failure is counted so the cost report stays accurate.
+        let content = null;
+        const routeToGemini = Math.random() < GEMINI_JUDGE_FRACTION;
+        if (routeToGemini) {
+            const g = await callGeminiJudge(systemPrompt, userPrompt);
+            if (g.ok) {
+                content = g.content;
+                bumpModelTally('geminiBatches');
+            } else {
+                bumpModelTally('geminiErrors');
+                console.warn('[FF-JRD] Gemini judge failed — falling back to OpenAI:', g.error, g.message);
+            }
         }
-        if (!res.ok) {
-            const txt = await res.text().catch(() => '');
-            return { ok: false, error: `OPENAI_${res.status}`, message: txt.slice(0, 400) };
+        if (content == null) {
+            const o = await callOpenAiJudge(systemPrompt, userPrompt);
+            if (!o.ok) return o;
+            content = o.content;
+            bumpModelTally('openaiBatches');
         }
-        const data = await res.json();
-        const content = data?.choices?.[0]?.message?.content || '{}';
+
         let parsed = null;
         try { parsed = JSON.parse(content); } catch { /* ignore */ }
         if (!parsed || !Array.isArray(parsed.decisions)) {
-            return { ok: false, error: 'BAD_AI_JSON', message: content.slice(0, 400) };
+            return { ok: false, error: 'BAD_AI_JSON', message: String(content).slice(0, 400) };
         }
         const VALID_SKIP_KINDS = new Set([
             'threshold', 'role-mismatch', 'seniority-mismatch',
@@ -2759,6 +2898,13 @@ async function reportSessionStat(reason = 'stop') {
             errors: stats.errors || 0,
             skipsByKind: skips,
             skipsRollup: { ...skipsRollup, other: Math.max(0, skipsOther) },
+            // Judge-model split for the cost report: how many batches ran on
+            // Gemini vs OpenAI, and how many Gemini calls failed (→ OpenAI).
+            modelStats: {
+                geminiBatches: stats.geminiBatches || 0,
+                geminiErrors: stats.geminiErrors || 0,
+                openaiBatches: stats.openaiBatches || 0,
+            },
             startedAt,
             endedAt: new Date().toISOString(),
             extensionVersion: chrome?.runtime?.getManifest?.()?.version || '',
