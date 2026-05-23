@@ -1039,6 +1039,19 @@ button.ghost.icon { padding: 7px 10px; font-size: 14px; }
 }
 .outcome-chip.pushing { background: rgba(249, 115, 22, 0.15); color: var(--orange); border-color: var(--orange); }
 
+/* JD source chip — shows which platform the JD was scraped from. */
+.src-chip {
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 600;
+    border: 1px solid;
+    letter-spacing: 0.02em;
+}
+.src-chip.src-site { background: rgba(34, 197, 94, 0.10); color: var(--green); border-color: var(--green-dim); }
+.src-chip.src-jr { background: rgba(110, 118, 129, 0.12); color: var(--fg-muted); border-color: var(--fg-muted); }
+.src-chip.src-hcafe { background: rgba(168, 85, 247, 0.12); color: #a855f7; border-color: #a855f7; }
+
 .empty-state {
     padding: 24px 14px;
     text-align: center;

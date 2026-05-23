@@ -962,6 +962,63 @@ async function resolveViaScraper(jobId) {
     };
 }
 
+// Skip site-side JD fetch for these hosts. LinkedIn blocks Playwright +
+// requires auth, JR fallback URLs would just re-fetch our own backend,
+// hiring.cafe is the source itself.
+const SITE_FETCH_SKIP_HOSTS = [
+    /linkedin\.com/i,
+    /jobright\.ai/i,
+    /hiring\.cafe/i,
+];
+const SITE_FETCH_MIN_DESC = 300;
+const SITE_FETCH_CACHE = new Map(); // url → { description, location, method, confidence }
+
+// fetchSiteJobDetail — ask scraper backend's Playwright to open the apply
+// URL, run DOM extractors, return site-side JD + location. Used to
+// upgrade JR/hiring.cafe descriptions (which are summaries) with the real
+// page content. Falls back silently on any failure.
+async function fetchSiteJobDetail(applyUrl) {
+    if (!applyUrl || typeof applyUrl !== 'string') {
+        return { ok: false, error: 'BAD_INPUT' };
+    }
+    let host;
+    try { host = new URL(applyUrl).hostname; } catch { return { ok: false, error: 'BAD_URL' }; }
+    for (const rx of SITE_FETCH_SKIP_HOSTS) {
+        if (rx.test(host)) return { ok: false, error: 'SKIPPED_HOST', message: host };
+    }
+    if (SITE_FETCH_CACHE.has(applyUrl)) {
+        return { ok: true, ...SITE_FETCH_CACHE.get(applyUrl), cached: true };
+    }
+    const base = SCRAPER_BASE_URL.replace(/\/+$/, '');
+    let res;
+    try {
+        res = await fetch(`${base}/api/fetch-jd`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', accept: 'application/json' },
+            body: JSON.stringify({ url: applyUrl }),
+        });
+    } catch (e) {
+        return { ok: false, error: 'NETWORK', message: e.message };
+    }
+    let body = null;
+    try { body = await res.json(); } catch {}
+    if (!res.ok || !body?.success) {
+        return {
+            ok: false,
+            error: body?.error || `HTTP_${res.status}`,
+            message: body?.message || `scraper returned ${res.status}`,
+        };
+    }
+    const payload = {
+        description: body.description || '',
+        location: body.location || '',
+        method: body.method || '',
+        confidence: body.confidence || 0,
+    };
+    SITE_FETCH_CACHE.set(applyUrl, payload);
+    return { ok: true, ...payload };
+}
+
 // resolveJobDetail: returns the real applyLink + fully-composed
 // jobDescription for a JR jobId.
 //
@@ -1134,7 +1191,7 @@ async function resolvePicksAsync() {
     console.log('[FF-JRD] resolvePicksAsync done:', { resolved, failed, linkedinDropped });
 }
 
-async function pushJob({ job, clientEmail, clientName }) {
+async function pushJob({ job, clientEmail, clientName, descSource = '' }) {
     const email = String(clientEmail).toLowerCase();
     const title = String(job.title || '').slice(0, 50).trim();
     const company = String(job.company || '').trim();
@@ -1166,6 +1223,9 @@ async function pushJob({ job, clientEmail, clientName }) {
         // 5-digit operator code identifies WHICH human operator pushed.
         // Backend resolves it to addedBy / extensionCode on the JobModel.
         extensionCode: state.config.extensionCode || '',
+        // descSource — 'site:<method>' | 'jobright' | 'hiringcafe'. Stored
+        // by the dashboard backend for analytics; ignored if unknown.
+        descSource: descSource || '',
     };
     console.log('[FF-JRD] /addjob →', {
         jobTitle: title,
@@ -1174,6 +1234,7 @@ async function pushJob({ job, clientEmail, clientName }) {
         descLen: payload.jobDetails.jobDescription.length,
         descPreview: payload.jobDetails.jobDescription.slice(0, 120),
         joblink: joblink,
+        descSource,
     });
     const r = await dashboardFetch('/addjob', { method: 'POST', body: JSON.stringify(payload) });
     console.log('[FF-JRD] /addjob ←', r.status, r.body?.message || r.bodyText?.slice(0, 200) || '');
@@ -2292,11 +2353,32 @@ async function autoPushOne(job, decision) {
         });
         return { outcome: 'blocked', code: 'LINKEDIN_APPLY' };
     }
-    notifyPopup('push-start', { jobId: job.jobId, title: job.title, company: job.company });
+    // Default source by where the job came from. JR jobIds are 24-char hex;
+    // hiring.cafe uses composite "src___board___orig" IDs.
+    let descSource = /^[a-f0-9]{24}$/i.test(job.jobId) ? 'jobright' : 'hiringcafe';
+    let location = job.location || '';
+    let siteMethod = '';
+    // Try to upgrade JD + location from the real site. Falls back silently
+    // on host-skip / nav-timeout / thin-content — descSource stays as the
+    // platform default so the UI chip tells the operator the truth.
+    if (applyUrl) {
+        const site = await fetchSiteJobDetail(applyUrl);
+        if (site.ok && site.description.length >= SITE_FETCH_MIN_DESC) {
+            description = site.description;
+            if (site.location) location = site.location;
+            siteMethod = site.method || 'site';
+            descSource = `site:${siteMethod}`;
+            console.log('[FF-JRD] site JD ok', job.jobId, siteMethod, site.description.length, 'chars');
+        } else {
+            console.log('[FF-JRD] site JD skipped/failed', job.jobId, site.error || 'unknown', '— keeping', descSource);
+        }
+    }
+    notifyPopup('push-start', { jobId: job.jobId, title: job.title, company: job.company, descSource });
     const r = await pushJob({
-        job: { ...job, applyUrl, description },
+        job: { ...job, applyUrl, description, location },
         clientEmail: state.config.authEmail,
         clientName: state.config.authName,
+        descSource,
     });
     const body = r.body || {};
     let outcome, outcomeDetail = '';
@@ -2328,8 +2410,8 @@ async function autoPushOne(job, decision) {
         outcomeDetail = body?.message || `HTTP ${r.status}`;
         state.auto.stats.errors += 1;
     }
-    notifyPopup('push-result', { jobId: job.jobId, outcome, detail: outcomeDetail });
-    return { outcome, applyUrl, description };
+    notifyPopup('push-result', { jobId: job.jobId, outcome, detail: outcomeDetail, descSource });
+    return { outcome, applyUrl, description, descSource };
 }
 
 // runAutoBatch: judge a slice → for picks, resolve+push in parallel.
@@ -3019,15 +3101,31 @@ async function pushSelected({ jobIds }) {
             console.warn('[FF-JRD] push-time resolve failed', j.jobId, detail.error || detail.message);
         }
 
+        // Upgrade JD + location from the real job site before pushing.
+        // Default source = platform of origin; flip to 'site:<method>' on
+        // successful fetch. Failure falls back silently.
+        let descSource = /^[a-f0-9]{24}$/i.test(j.jobId) ? 'jobright' : 'hiringcafe';
+        let pushDesc = j.description || j.matchSummary || '';
+        let pushLoc = j.location || '';
+        if (j.applyUrl) {
+            const site = await fetchSiteJobDetail(j.applyUrl);
+            if (site.ok && site.description.length >= SITE_FETCH_MIN_DESC) {
+                pushDesc = site.description;
+                if (site.location) pushLoc = site.location;
+                descSource = `site:${site.method || 'site'}`;
+                console.log('[FF-JRD] push: site JD ok', j.jobId, site.method, site.description.length, 'chars');
+            } else {
+                console.log('[FF-JRD] push: site JD skipped/failed', j.jobId, site.error || 'unknown');
+            }
+        }
         const r = await pushJob({
-            // Push the FULL resolved JD (resolveJobDetail composed:
-            // jobSummary + Responsibilities + Must have + Nice to have +
-            // Key skills + Benefits). Falls back to matchSummary only
-            // when resolve never landed for this job. AI score/reason
+            // Push the FULL resolved JD (site-side when available; else
+            // composed from JR/hiring.cafe payload). AI score/reason
             // belongs on the dashboard's metadata, NOT in the JD body.
-            job: { ...j, description: j.description || j.matchSummary || '' },
+            job: { ...j, description: pushDesc, location: pushLoc },
             clientEmail: state.config.authEmail,
             clientName: state.config.authName,
+            descSource,
         });
         const body = r.body || {};
         let outcome, outcomeDetail = '';
@@ -3085,7 +3183,7 @@ async function pushSelected({ jobIds }) {
                 status: r.status, message: body?.message || JSON.stringify(body || {}).slice(0, 200),
             });
         }
-        notifyPopup('push-result', { jobId: j.jobId, outcome, detail: outcomeDetail });
+        notifyPopup('push-result', { jobId: j.jobId, outcome, detail: outcomeDetail, descSource });
         notifyPopup('push-progress', {
             done: results.pushed.length + results.duplicates.length + results.blocked.length + results.errors.length,
             target: picks.length,

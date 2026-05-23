@@ -1039,7 +1039,7 @@ function scoreClass(score) {
 }
 
 function renderCard(entry) {
-    const { decision, job, outcome, detail, pushing, selectedPick, manualFlip } = entry;
+    const { decision, job, outcome, detail, pushing, selectedPick, manualFlip, descSource } = entry;
     const card = document.createElement('div');
     const effectivePick = isJudged ? !!selectedPick : !!decision.pick;
     const pickClass = effectivePick ? 'pick' : 'skip';
@@ -1094,6 +1094,15 @@ function renderCard(entry) {
         }
     } else if (decision.pick === false) {
         outcomeHtml = `<span class="outcome-chip skipped">skipped</span>`;
+    }
+    // Description source chip — shows whether the JD that was pushed came
+    // from the real job site (Greenhouse/Lever/etc.) or fell back to the
+    // JR/hiring.cafe payload. Only render once a push actually happened.
+    if (outcome === 'pushed' && descSource) {
+        const isSite = descSource.startsWith('site:');
+        const chipClass = isSite ? 'src-site' : (descSource === 'jobright' ? 'src-jr' : 'src-hcafe');
+        const chipLabel = isSite ? `📄 ${descSource.slice(5)}` : (descSource === 'jobright' ? '📄 jobright' : '📄 hiring.cafe');
+        outcomeHtml += `<span class="src-chip ${chipClass}" title="JD source: ${escapeHtml(descSource)}">${escapeHtml(chipLabel)}</span>`;
     }
 
     card.innerHTML = `
@@ -1231,12 +1240,13 @@ function ingestPushStart({ jobId, title, company }) {
     pushTickerLine(`→ pushing "${title}" @ ${company}`, 'push');
 }
 
-function ingestPushResult({ jobId, outcome, detail }) {
+function ingestPushResult({ jobId, outcome, detail, descSource }) {
     const entry = decisionsMap.get(jobId);
     if (!entry) return;
     entry.outcome = outcome;
     entry.detail = detail || '';
     entry.pushing = false;
+    if (descSource) entry.descSource = descSource;
     decisionsMap.set(jobId, entry);
     rebuildList();
     recomputeOutcomeChips();

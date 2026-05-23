@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "FlashFire JR → Dashboard Direct",
-  "version": "1.42.1",
+  "version": "1.43.0",
   "description": "Scrape jobright.ai + hiring.cafe job listings, AI-judge in-extension against client profile, push picks straight to FlashFire dashboard.",
   "permissions": ["storage", "activeTab", "tabs", "scripting"],
   "host_permissions": [
