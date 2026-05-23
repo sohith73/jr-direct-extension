@@ -221,6 +221,66 @@ function escapeHtml(s) {
     }[c]));
 }
 
+// Map a hostname to a friendly source label. Recognises common ATSes,
+// otherwise returns the registrable root domain title-cased.
+const _ATS_HOSTS = [
+    [/greenhouse\.io|boards\.greenhouse/i, 'Greenhouse'],
+    [/lever\.co/i, 'Lever'],
+    [/ashbyhq\.com|jobs\.ashbyhq/i, 'Ashby'],
+    [/myworkdayjobs|workday/i, 'Workday'],
+    [/smartrecruiters/i, 'SmartRecruiters'],
+    [/bamboohr/i, 'BambooHR'],
+    [/icims\.com/i, 'iCIMS'],
+    [/indeed\.com/i, 'Indeed'],
+    [/linkedin\.com/i, 'LinkedIn'],
+    [/jobright\.ai/i, 'JobRight'],
+    [/hiring\.cafe/i, 'hiring.cafe'],
+];
+function hostToSourceLabel(host) {
+    if (!host) return '';
+    const clean = String(host).replace(/^www\./, '');
+    for (const [rx, label] of _ATS_HOSTS) if (rx.test(clean)) return label;
+    const parts = clean.split('.');
+    const root = parts.length >= 2 ? parts[parts.length - 2] : clean;
+    return root.charAt(0).toUpperCase() + root.slice(1);
+}
+
+// jdSourceForCard — resolve {label, cls, tooltip} for the per-card source
+// chip. Prefers the post-push descSource (which carries the real extractor
+// method), falls back to the apply URL host. Returns null when nothing
+// useful to show (e.g. no applyUrl).
+function jdSourceForCard(job, descSource) {
+    const url = String(job?.applyUrl || '').replace('__LINKEDIN_BLOCKED__:', '');
+    if (!url) return null;
+    let host = '';
+    try { host = new URL(url).hostname; } catch {}
+    // Post-push refinement: "site:greenhouse" → friendly + green chip.
+    if (typeof descSource === 'string' && descSource.startsWith('site:')) {
+        const method = descSource.slice(5);
+        const label = method.startsWith('site-')
+            ? hostToSourceLabel(method.slice(5))
+            : (method === 'json-ld' || method === 'meta-tags' || method === 'generic'
+                ? hostToSourceLabel(host)
+                : method);
+        return { label: `📄 ${label}`, cls: 'src-site', tooltip: descSource };
+    }
+    if (descSource === 'jobright') {
+        return { label: '📄 JobRight', cls: 'src-jr', tooltip: 'JD from JobRight payload' };
+    }
+    if (descSource === 'hiringcafe') {
+        return { label: '📄 hiring.cafe', cls: 'src-hcafe', tooltip: 'JD from hiring.cafe payload' };
+    }
+    // Default (skip cards / pre-push): derive from URL host.
+    const label = hostToSourceLabel(host);
+    if (!label) return null;
+    // Color heuristic: if host is JR/hcafe themselves → platform chip,
+    // else neutral "site" chip so picks-yet-to-push aren't visually
+    // claimed as site-fetched.
+    if (/jobright\.ai/i.test(host)) return { label: `📄 JobRight`, cls: 'src-jr', tooltip: host };
+    if (/hiring\.cafe/i.test(host)) return { label: `📄 hiring.cafe`, cls: 'src-hcafe', tooltip: host };
+    return { label: `🔗 ${label}`, cls: 'src-host', tooltip: host };
+}
+
 function setProcessing(on, label = '') {
     isProcessing = on;
     els.processingWarn.hidden = !on;
@@ -1082,6 +1142,15 @@ function renderCard(entry) {
         } else {
             actionsHtml += `<a href="${escapeHtml(displayUrl)}" target="_blank" rel="noreferrer">View ↗</a>`;
         }
+        // JD source chip — always rendered next to View so operator can tell
+        // at a glance where the description came from. Defaults to the apply
+        // URL host (e.g. "Greenhouse" from boards.greenhouse.io). Refines to
+        // the extractor's method label once the in-extension site-fetch lands
+        // for picks; falls back to "jobright"/"hiring.cafe" for source platforms.
+        const srcInfo = jdSourceForCard(job, descSource);
+        if (srcInfo) {
+            actionsHtml += `<span class="src-chip ${srcInfo.cls}" title="JD source: ${escapeHtml(srcInfo.tooltip)}">${escapeHtml(srcInfo.label)}</span>`;
+        }
     }
     let outcomeHtml = '';
     if (pushing) {
@@ -1094,15 +1163,6 @@ function renderCard(entry) {
         }
     } else if (decision.pick === false) {
         outcomeHtml = `<span class="outcome-chip skipped">skipped</span>`;
-    }
-    // Description source chip — shows whether the JD that was pushed came
-    // from the real job site (Greenhouse/Lever/etc.) or fell back to the
-    // JR/hiring.cafe payload. Only render once a push actually happened.
-    if (outcome === 'pushed' && descSource) {
-        const isSite = descSource.startsWith('site:');
-        const chipClass = isSite ? 'src-site' : (descSource === 'jobright' ? 'src-jr' : 'src-hcafe');
-        const chipLabel = isSite ? `📄 ${descSource.slice(5)}` : (descSource === 'jobright' ? '📄 jobright' : '📄 hiring.cafe');
-        outcomeHtml += `<span class="src-chip ${chipClass}" title="JD source: ${escapeHtml(descSource)}">${escapeHtml(chipLabel)}</span>`;
     }
 
     card.innerHTML = `
@@ -1830,8 +1890,25 @@ chrome.runtime.onMessage.addListener((msg) => {
                 setLive('Resolving JDs', `Pulling full descriptions for ${msg.total} job${msg.total === 1 ? '' : 's'}…`);
             } else if (msg.stage === 'resolved') {
                 setLive('Resolving JDs', `${msg.done || 0}/${msg.total} JDs ready · then GPT scores…`);
+            } else if (msg.stage === 'site-fetching') {
+                setLive('Scraping sites', `Opening ${msg.total} apply page${msg.total === 1 ? '' : 's'} to extract real JD…`);
+            } else if (msg.stage === 'site-fetched') {
+                setLive('Scraping sites', `${msg.done || 0}/${msg.total} site JDs ready · then GPT scores…`);
             }
             break;
+        case 'site-jd-resolved': {
+            // Pre-judge site fetch succeeded for one job. Stamp the
+            // decision entry's descSource so the source chip flips to
+            // green ("📄 Greenhouse") as soon as the window closes,
+            // without waiting for the push round-trip.
+            const entry = decisionsMap.get(msg.jobId);
+            if (entry) {
+                entry.descSource = msg.descSource;
+                decisionsMap.set(msg.jobId, entry);
+                rebuildList();
+            }
+            break;
+        }
         case 'ai-batch-start': handleAiBatchStart(msg); break;
         case 'ai-progress': handleAiProgress(msg); break;
         case 'push-progress': handlePushProgress(msg); break;

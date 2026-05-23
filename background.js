@@ -11,6 +11,7 @@
 // settings only expose the auto-pipeline cadence.
 
 import { API_URLS, API_BASE_URL, SCRAPER_BASE_URL } from './exports.js';
+import { fetchSiteJobDetailInBrowser } from './site-jd-fetcher.js';
 
 const DEFAULTS = {
     aiThreshold: 50,
@@ -962,61 +963,20 @@ async function resolveViaScraper(jobId) {
     };
 }
 
-// Skip site-side JD fetch for these hosts. LinkedIn blocks Playwright +
-// requires auth, JR fallback URLs would just re-fetch our own backend,
-// hiring.cafe is the source itself.
-const SITE_FETCH_SKIP_HOSTS = [
-    /linkedin\.com/i,
-    /jobright\.ai/i,
-    /hiring\.cafe/i,
-];
+// Site-side JD fetch is performed in-extension by site-jd-fetcher.js:
+//   - opens the apply URL in a minimized, unfocused Chrome window
+//   - runs the ported FlashFire DOM extractors against the rendered DOM
+//   - closes the window in finally
+//
+// Threshold matches the in-extension fetcher's own gate; we re-export
+// here so the push callers can branch on it consistently.
 const SITE_FETCH_MIN_DESC = 300;
-const SITE_FETCH_CACHE = new Map(); // url → { description, location, method, confidence }
 
-// fetchSiteJobDetail — ask scraper backend's Playwright to open the apply
-// URL, run DOM extractors, return site-side JD + location. Used to
-// upgrade JR/hiring.cafe descriptions (which are summaries) with the real
-// page content. Falls back silently on any failure.
+// Thin wrapper so existing call sites stay unchanged. The in-extension
+// fetcher returns the same { ok, description, location, method, ... }
+// shape as the old backend route.
 async function fetchSiteJobDetail(applyUrl) {
-    if (!applyUrl || typeof applyUrl !== 'string') {
-        return { ok: false, error: 'BAD_INPUT' };
-    }
-    let host;
-    try { host = new URL(applyUrl).hostname; } catch { return { ok: false, error: 'BAD_URL' }; }
-    for (const rx of SITE_FETCH_SKIP_HOSTS) {
-        if (rx.test(host)) return { ok: false, error: 'SKIPPED_HOST', message: host };
-    }
-    if (SITE_FETCH_CACHE.has(applyUrl)) {
-        return { ok: true, ...SITE_FETCH_CACHE.get(applyUrl), cached: true };
-    }
-    const base = SCRAPER_BASE_URL.replace(/\/+$/, '');
-    let res;
-    try {
-        res = await fetch(`${base}/api/fetch-jd`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json', accept: 'application/json' },
-            body: JSON.stringify({ url: applyUrl }),
-        });
-    } catch (e) {
-        return { ok: false, error: 'NETWORK', message: e.message };
-    }
-    let body = null;
-    try { body = await res.json(); } catch {}
-    if (!res.ok || !body?.success) {
-        return {
-            ok: false,
-            error: body?.error || `HTTP_${res.status}`,
-            message: body?.message || `scraper returned ${res.status}`,
-        };
-    }
-    const payload = {
-        description: body.description || '',
-        location: body.location || '',
-        method: body.method || '',
-        confidence: body.confidence || 0,
-    };
-    SITE_FETCH_CACHE.set(applyUrl, payload);
-    return { ok: true, ...payload };
+    return fetchSiteJobDetailInBrowser(applyUrl);
 }
 
 // resolveJobDetail: returns the real applyLink + fully-composed
@@ -1537,6 +1497,63 @@ ${JSON.stringify(slim, null, 2)}`;
 // prompt builder picks up the full description. Falls back to matchSummary
 // when scraper is unreachable for a job — never blocks the whole batch
 // on a single failure. Resolutions are cached, so a re-judge is cheap.
+// resolveSiteJDsPreJudge — open every job's apply URL in a hidden window
+// (via site-jd-fetcher) and replace `description` with the site-side JD
+// before the AI judge runs. Mutates jobs in place. Skip-hosts and
+// fetch failures leave the existing description (JR/hcafe) untouched, so
+// judge always has SOMETHING to work with.
+//
+// Each job also gets `_siteJD` { ok, method, sourceLabel, host } so the
+// downstream push path can reuse the same fetch without re-opening the
+// window, and the sidepanel can show the upgraded chip immediately.
+//
+// Concurrency is governed by site-jd-fetcher's internal semaphore (cap 2)
+// — we Promise.all everything and let the semaphore queue.
+async function resolveSiteJDsPreJudge(jobs) {
+    if (!Array.isArray(jobs) || jobs.length === 0) return { upgraded: 0, kept: 0 };
+    notifyPopup('judge-prep', { stage: 'site-fetching', total: jobs.length });
+    let upgraded = 0;
+    let kept = 0;
+    let done = 0;
+    await Promise.all(jobs.map(async (j) => {
+        try {
+            const r = await fetchSiteJobDetailInBrowser(j.applyUrl);
+            if (r.ok && r.description && r.description.length >= 300) {
+                j.description = r.description;
+                if (r.location) j.location = r.location;
+                j._siteJD = {
+                    ok: true,
+                    method: r.method,
+                    sourceLabel: r.sourceLabel,
+                    host: r.sourceHost,
+                    descSource: `site:${r.method || 'site'}`,
+                };
+                upgraded += 1;
+                // Push the upgraded source chip into the UI immediately so
+                // the operator sees it light up while later jobs are still
+                // being fetched.
+                notifyPopup('site-jd-resolved', {
+                    jobId: j.jobId,
+                    descSource: j._siteJD.descSource,
+                    sourceLabel: r.sourceLabel,
+                });
+            } else {
+                j._siteJD = { ok: false, error: r.error };
+                kept += 1;
+            }
+        } catch (e) {
+            j._siteJD = { ok: false, error: 'THREW', message: e?.message };
+            kept += 1;
+            console.warn('[FF-JRD] resolveSiteJDsPreJudge failed for', j.jobId, e?.message);
+        } finally {
+            done += 1;
+            notifyPopup('judge-prep', { stage: 'site-fetched', done, total: jobs.length });
+        }
+    }));
+    console.log('[FF-JRD] resolveSiteJDsPreJudge done — upgraded', upgraded, '/ kept', kept);
+    return { upgraded, kept };
+}
+
 async function resolvePreJudge(jobs, { concurrency = 5 } = {}) {
     if (!Array.isArray(jobs) || jobs.length === 0) return { resolved: 0, fallback: 0 };
     notifyPopup('judge-prep', { stage: 'resolving', total: jobs.length });
@@ -2353,25 +2370,14 @@ async function autoPushOne(job, decision) {
         });
         return { outcome: 'blocked', code: 'LINKEDIN_APPLY' };
     }
-    // Default source by where the job came from. JR jobIds are 24-char hex;
-    // hiring.cafe uses composite "src___board___orig" IDs.
+    // Default source = platform of origin. Pre-judge already attempted a
+    // site fetch and stamped `_siteJD` on the job; if it succeeded,
+    // job.description already holds the site JD. Use the cached metadata
+    // to label the source — no second site-fetch round-trip here.
     let descSource = /^[a-f0-9]{24}$/i.test(job.jobId) ? 'jobright' : 'hiringcafe';
     let location = job.location || '';
-    let siteMethod = '';
-    // Try to upgrade JD + location from the real site. Falls back silently
-    // on host-skip / nav-timeout / thin-content — descSource stays as the
-    // platform default so the UI chip tells the operator the truth.
-    if (applyUrl) {
-        const site = await fetchSiteJobDetail(applyUrl);
-        if (site.ok && site.description.length >= SITE_FETCH_MIN_DESC) {
-            description = site.description;
-            if (site.location) location = site.location;
-            siteMethod = site.method || 'site';
-            descSource = `site:${siteMethod}`;
-            console.log('[FF-JRD] site JD ok', job.jobId, siteMethod, site.description.length, 'chars');
-        } else {
-            console.log('[FF-JRD] site JD skipped/failed', job.jobId, site.error || 'unknown', '— keeping', descSource);
-        }
+    if (job._siteJD?.ok) {
+        descSource = job._siteJD.descSource || `site:${job._siteJD.method || 'site'}`;
     }
     notifyPopup('push-start', { jobId: job.jobId, title: job.title, company: job.company, descSource });
     const r = await pushJob({
@@ -2434,11 +2440,18 @@ async function runAutoBatch(batch, opts = {}) {
         console.log('[FF-JRD] auto: profile loaded; aiSummary=' + (ctx.aiSummary ? ctx.aiSummary.length + ' chars' : 'none'));
         // Mark before judging so concurrent ingest doesn't re-queue.
         for (const j of batch) state.auto.processed.add(j.jobId);
-        // Pre-judge: resolve full JD so OpenAI sees real disqualifiers
-        // buried in the body, not just the 200-char matchSummary preview.
-        // resolveJobDetail is cached so this is cheap on re-runs.
-        console.log('[FF-JRD] auto: resolving full JDs for batch of', batch.length);
+        // Pre-judge step 1: pull JR's composed full JD via the SW fetcher.
+        // Cheap, cached, gives OpenAI more than the 200-char matchSummary
+        // for jobs where the site-fetch later falls back.
+        console.log('[FF-JRD] auto: resolving full JR JDs for batch of', batch.length);
         await resolvePreJudge(batch);
+        // Pre-judge step 2: open every apply URL in a minimized hidden
+        // window, scrape JD + location via the FlashFire extractors, and
+        // REPLACE the description. Judge now runs on the real org-site
+        // body, not JR's summary. Failures (skip-host / thin / timeout)
+        // silently keep the JR JD from step 1.
+        console.log('[FF-JRD] auto: resolving site JDs (hidden windows) for batch of', batch.length);
+        await resolveSiteJDsPreJudge(batch);
         console.log('[FF-JRD] auto: judging', batch.length, 'jobs via OpenAI…');
         const judge = await aiJudge({
             profile: ctx.profile,
@@ -3101,22 +3114,14 @@ async function pushSelected({ jobIds }) {
             console.warn('[FF-JRD] push-time resolve failed', j.jobId, detail.error || detail.message);
         }
 
-        // Upgrade JD + location from the real job site before pushing.
-        // Default source = platform of origin; flip to 'site:<method>' on
-        // successful fetch. Failure falls back silently.
+        // Site JD already resolved pre-judge (resolveSiteJDsPreJudge).
+        // `j.description` + `j.location` were mutated in place; just label
+        // the source for the dashboard payload + UI chip.
         let descSource = /^[a-f0-9]{24}$/i.test(j.jobId) ? 'jobright' : 'hiringcafe';
         let pushDesc = j.description || j.matchSummary || '';
         let pushLoc = j.location || '';
-        if (j.applyUrl) {
-            const site = await fetchSiteJobDetail(j.applyUrl);
-            if (site.ok && site.description.length >= SITE_FETCH_MIN_DESC) {
-                pushDesc = site.description;
-                if (site.location) pushLoc = site.location;
-                descSource = `site:${site.method || 'site'}`;
-                console.log('[FF-JRD] push: site JD ok', j.jobId, site.method, site.description.length, 'chars');
-            } else {
-                console.log('[FF-JRD] push: site JD skipped/failed', j.jobId, site.error || 'unknown');
-            }
+        if (j._siteJD?.ok) {
+            descSource = j._siteJD.descSource || `site:${j._siteJD.method || 'site'}`;
         }
         const r = await pushJob({
             // Push the FULL resolved JD (site-side when available; else
