@@ -1711,35 +1711,23 @@ function bumpModelTally(key, n = 1) {
     state.auto.stats[key] = (state.auto.stats[key] || 0) + n;
 }
 
-// callOpenAiJudge: one judge batch on gpt-4o-mini. Returns { ok, content }.
+// callOpenAiJudge — fallback judge path. Routes through the dashboard
+// backend's /extension/openai-judge so the OPENAI_API_KEY stays server-
+// side (no more `state.config.openaiKey` in browser storage). Only fires
+// when Gemini returns !ok.
 async function callOpenAiJudge(system, user) {
-    let res;
-    try {
-        res = await fetch('https://api.openai.com/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-                'content-type': 'application/json',
-                authorization: `Bearer ${state.config.openaiKey}`,
-            },
-            body: JSON.stringify({
-                model: 'gpt-4o-mini',
-                messages: [
-                    { role: 'system', content: system },
-                    { role: 'user', content: user },
-                ],
-                response_format: { type: 'json_object' },
-                temperature: 0,
-            }),
-        });
-    } catch (e) {
-        return { ok: false, error: 'NETWORK', message: e.message };
+    const r = await dashboardFetch('/extension/openai-judge', {
+        method: 'POST',
+        body: JSON.stringify({ system, user, temperature: 0 }),
+    });
+    if (!r.ok || !r.body || r.body.ok !== true || typeof r.body.content !== 'string') {
+        return {
+            ok: false,
+            error: r.body?.error || r.error || 'OPENAI_JUDGE_FAILED',
+            message: r.body?.message || r.errorDetail || '',
+        };
     }
-    if (!res.ok) {
-        const txt = await res.text().catch(() => '');
-        return { ok: false, error: `OPENAI_${res.status}`, message: txt.slice(0, 400) };
-    }
-    const data = await res.json();
-    return { ok: true, content: data?.choices?.[0]?.message?.content || '{}' };
+    return { ok: true, content: r.body.content };
 }
 
 // callGeminiJudge: one judge batch via the dashboard backend's Vertex AI
@@ -2273,7 +2261,8 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '', skipAgeGate =
 
 async function judgeOnly() {
     if (!state.config.authEmail) return { ok: false, error: 'NO_CLIENT', message: 'pick a client first' };
-    if (!state.config.openaiKey) return { ok: false, error: 'NO_OPENAI_KEY', message: 'set OpenAI API key' };
+    // No openaiKey gate — judge calls are backend-proxied (Gemini primary,
+    // OpenAI fallback). Backend holds both keys.
     const jobs = [...state.capture.jobs.values()];
     if (jobs.length === 0) return { ok: false, error: 'NO_JOBS', message: 'capture is empty' };
 
@@ -2333,7 +2322,7 @@ async function ensureAutoProfile() {
         return { ok: true, profile: state.auto.profile, aiSummary: state.auto.aiSummary };
     }
     if (!state.config.authEmail) return { ok: false, error: 'NO_CLIENT' };
-    if (!state.config.openaiKey) return { ok: false, error: 'NO_OPENAI_KEY' };
+    // No openaiKey gate — backend-proxied judge.
     const profileRes = await getProfile(state.config.authEmail);
     if (!profileRes.ok) return { ok: false, error: 'PROFILE_LOAD', message: profileRes.error };
     state.auto.profile = profileRes.profile;
@@ -2549,10 +2538,7 @@ function tryAutoBatch() {
         console.warn('[FF-JRD] auto: skip — NO_CLIENT (authEmail missing)');
         return;
     }
-    if (!state.config.openaiKey) {
-        console.warn('[FF-JRD] auto: skip — NO_OPENAI_KEY (state.config.openaiKey empty). Save Settings or set key.');
-        return;
-    }
+    // No openaiKey gate — judge calls are backend-proxied. Backend holds keys.
     const size = Math.max(1, Number(state.config.autoBatchSize) || 8);
     const pending = [];
     for (const j of state.capture.jobs.values()) {
@@ -2572,7 +2558,7 @@ function tryAutoBatch() {
 async function flushAutoBatch() {
     if (state.auto.capHit) return;
     if (!state.config.autoMode) return;
-    if (!state.config.authEmail || !state.config.openaiKey) return;
+    if (!state.config.authEmail) return;
 
     // 1. If a batch is already running, wait for it to finish before deciding
     //    if more pending exists. Without this the flush returns immediately
