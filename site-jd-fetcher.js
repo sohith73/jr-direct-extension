@@ -155,47 +155,71 @@ function friendlySource(method, host) {
 // Returns:
 //   { ok:true, description, location, method, confidence, sourceLabel, sourceHost, finalUrl, durationMs }
 //   { ok:false, error, message, durationMs }
-export async function fetchSiteJobDetailInBrowser(applyUrl) {
+// onStep(stepName, info?) is fired at every phase boundary so the UI can
+// render live progress per job. Step names:
+//   'queued' | 'skip-host' | 'cache-hit' | 'opening' | 'loading'
+//   'loaded' | 'settling' | 'injecting' | 'extracting' | 'thin' | 'ok' | 'error'
+export async function fetchSiteJobDetailInBrowser(applyUrl, onStep = null) {
+    const step = (name, info) => { try { onStep && onStep(name, info); } catch {} };
     const t0 = Date.now();
     if (!isHttpUrl(applyUrl)) {
+        step('error', { error: 'BAD_INPUT' });
         return { ok: false, error: 'BAD_INPUT', message: 'http(s) url required', durationMs: 0 };
     }
     const host = hostOf(applyUrl);
     for (const rx of SKIP_HOSTS) {
         if (rx.test(host)) {
+            step('skip-host', { host });
             return { ok: false, error: 'SKIPPED_HOST', message: host, durationMs: 0 };
         }
     }
     if (_resultCache.has(applyUrl)) {
         const cached = _resultCache.get(applyUrl);
+        step('cache-hit', { method: cached.method, sourceLabel: cached.sourceLabel });
         return { ok: true, ...cached, cached: true, durationMs: 0 };
     }
 
+    step('queued', { host });
     await acquire();
-    let windowId = null;
     let tabId = null;
+    let usedWindow = false;
+    let windowId = null;
     try {
-        // Minimized, unfocused window. The page still loads + scripts run,
-        // but the operator's foreground stays intact.
-        const win = await chrome.windows.create({
-            url: applyUrl,
-            focused: false,
-            state: 'minimized',
-            type: 'normal',
-        });
-        windowId = win.id;
-        tabId = win.tabs?.[0]?.id ?? null;
+        // Try background TAB in operator's current window first — tabs load
+        // reliably even when not active. Minimized windows can defer
+        // page-loads on some Chromiums, which was the original bug.
+        try {
+            const tab = await chrome.tabs.create({ url: applyUrl, active: false });
+            tabId = tab.id;
+            step('opening', { mode: 'background-tab', tabId });
+        } catch (err) {
+            // Fallback: spawn a separate minimized window. Some operator
+            // setups (no normal window open, locked sessions) need this.
+            const win = await chrome.windows.create({
+                url: applyUrl, focused: false, state: 'minimized', type: 'normal',
+            });
+            windowId = win.id;
+            tabId = win.tabs?.[0]?.id ?? null;
+            usedWindow = true;
+            step('opening', { mode: 'minimized-window', windowId, tabId });
+        }
         if (!tabId) {
-            return { ok: false, error: 'NO_TAB', message: 'window opened without a tab', durationMs: Date.now() - t0 };
+            step('error', { error: 'NO_TAB' });
+            return { ok: false, error: 'NO_TAB', message: 'no tab created', durationMs: Date.now() - t0 };
         }
 
-        await waitForTabComplete(tabId, NAV_TIMEOUT_MS);
-        // Per-host settle for SPA hydration.
-        await new Promise((r) => setTimeout(r, settleFor(applyUrl)));
+        step('loading', { tabId });
+        const loadReason = await waitForTabComplete(tabId, NAV_TIMEOUT_MS);
+        step('loaded', { reason: loadReason });
+        if (loadReason === 'timeout') {
+            // Continue anyway — extractors might still find usable content.
+            // Reported but not fatal.
+        }
+        const settleMs = settleFor(applyUrl);
+        step('settling', { ms: settleMs });
+        await new Promise((r) => setTimeout(r, settleMs));
 
-        // Inject extractor files in dependency order. Each runs an IIFE
-        // that mutates window.FFExtract. ISOLATED world keeps our globals
-        // off the page's window object.
+        step('injecting', { files: EXTRACTOR_FILES.length });
         try {
             await chrome.scripting.executeScript({
                 target: { tabId },
@@ -203,9 +227,11 @@ export async function fetchSiteJobDetailInBrowser(applyUrl) {
                 world: 'ISOLATED',
             });
         } catch (err) {
+            step('error', { error: 'INJECT_FAILED', message: err?.message });
             return { ok: false, error: 'INJECT_FAILED', message: err?.message || String(err), durationMs: Date.now() - t0 };
         }
 
+        step('extracting');
         let extracted;
         try {
             const results = await chrome.scripting.executeScript({
@@ -228,10 +254,12 @@ export async function fetchSiteJobDetailInBrowser(applyUrl) {
             });
             extracted = results?.[0]?.result;
         } catch (err) {
+            step('error', { error: 'EVAL_FAILED', message: err?.message });
             return { ok: false, error: 'EVAL_FAILED', message: err?.message || String(err), durationMs: Date.now() - t0 };
         }
 
         if (!extracted) {
+            step('error', { error: 'NO_DATA' });
             return { ok: false, error: 'NO_DATA', message: 'pipeline returned null', durationMs: Date.now() - t0 };
         }
 
@@ -241,6 +269,7 @@ export async function fetchSiteJobDetailInBrowser(applyUrl) {
         const sourceLabel = friendlySource(extracted.method, finalHost);
 
         if (desc.length < MIN_DESCRIPTION_CHARS) {
+            step('thin', { length: desc.length, method: extracted.method, sourceLabel });
             return {
                 ok: false,
                 error: 'THIN_CONTENT',
@@ -260,17 +289,16 @@ export async function fetchSiteJobDetailInBrowser(applyUrl) {
             finalUrl: extracted.finalUrl || applyUrl,
         };
         _resultCache.set(applyUrl, payload);
+        step('ok', { method: payload.method, sourceLabel, length: desc.length, host: finalHost });
         return { ok: true, ...payload, durationMs: Date.now() - t0 };
     } catch (err) {
+        step('error', { error: 'BROWSER_FAILURE', message: err?.message });
         return { ok: false, error: 'BROWSER_FAILURE', message: err?.message || String(err), durationMs: Date.now() - t0 };
     } finally {
-        // Always close. `tabs.remove` is safer than `windows.remove` when
-        // Chrome decides to merge the tab into another window on Linux —
-        // close the tab and the window cleanup follows.
         if (tabId != null) {
             try { await chrome.tabs.remove(tabId); } catch {}
         }
-        if (windowId != null) {
+        if (usedWindow && windowId != null) {
             try { await chrome.windows.remove(windowId); } catch {}
         }
         release();

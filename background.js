@@ -1517,7 +1517,16 @@ async function resolveSiteJDsPreJudge(jobs) {
     let done = 0;
     await Promise.all(jobs.map(async (j) => {
         try {
-            const r = await fetchSiteJobDetailInBrowser(j.applyUrl);
+            const r = await fetchSiteJobDetailInBrowser(j.applyUrl, (stepName, info) => {
+                // Broadcast each phase to sidepanel so operator sees per-job
+                // progress inline (not just console). Keep payload small.
+                notifyPopup('site-jd-step', {
+                    jobId: j.jobId,
+                    applyUrl: j.applyUrl,
+                    step: stepName,
+                    info: info || {},
+                });
+            });
             if (r.ok && r.description && r.description.length >= 300) {
                 j.description = r.description;
                 if (r.location) j.location = r.location;

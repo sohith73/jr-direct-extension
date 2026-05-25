@@ -1099,7 +1099,7 @@ function scoreClass(score) {
 }
 
 function renderCard(entry) {
-    const { decision, job, outcome, detail, pushing, selectedPick, manualFlip, descSource } = entry;
+    const { decision, job, outcome, detail, pushing, selectedPick, manualFlip, descSource, siteStep } = entry;
     const card = document.createElement('div');
     const effectivePick = isJudged ? !!selectedPick : !!decision.pick;
     const pickClass = effectivePick ? 'pick' : 'skip';
@@ -1177,9 +1177,46 @@ function renderCard(entry) {
         ${decision.matchedRole ? `<div class="matched-role"><span class="matched-role-label">Maps to preferred role</span><span class="matched-role-val">${escapeHtml(decision.matchedRole)}</span></div>` : ''}
         ${decision.skipKind ? `<div class="skip-kind-tag skip-kind-tag-${escapeHtml(decision.skipKind)}">${escapeHtml(skipKindLabel(decision.skipKind))}</div>` : ''}
         ${decision.reason ? `<div class="decision-reason">${escapeHtml(decision.reason)}</div>` : ''}
+        ${siteStep ? renderSiteStepBlock(siteStep, job.applyUrl) : ''}
         ${actionsHtml || outcomeHtml ? `<div class="decision-actions">${actionsHtml}${outcomeHtml}</div>` : ''}
     `;
     return card;
+}
+
+// renderSiteStepBlock — inline ledger of site-fetch progress per card.
+// One line per phase, error-coloured on failure, green on ok. Operator
+// sees exactly where the scrape stalled instead of staring at console.
+function renderSiteStepBlock(siteStep, applyUrl) {
+    if (!siteStep) return '';
+    const { step, info } = siteStep;
+    const host = (() => { try { return new URL(applyUrl).hostname; } catch { return ''; } })();
+    const LABELS = {
+        'queued':     ['⏳ Queued',            'site-step-info'],
+        'skip-host':  ['⊘ Skip-host',          'site-step-warn'],
+        'cache-hit':  ['✓ Cache hit',          'site-step-ok'],
+        'opening':    ['🪟 Opening tab',       'site-step-info'],
+        'loading':    ['⌛ Loading page',      'site-step-info'],
+        'loaded':     ['📄 Page loaded',       'site-step-info'],
+        'settling':   ['💤 Waiting hydration', 'site-step-info'],
+        'injecting':  ['💉 Injecting extractors', 'site-step-info'],
+        'extracting': ['🔍 Extracting JD',     'site-step-info'],
+        'thin':       ['⚠ Thin content',       'site-step-warn'],
+        'ok':         ['✅ Site JD ready',     'site-step-ok'],
+        'error':      ['❌ Failed',            'site-step-err'],
+    };
+    const [label, cls] = LABELS[step] || [step, 'site-step-info'];
+    const detailBits = [];
+    if (info?.host || host) detailBits.push(escapeHtml(info?.host || host));
+    if (info?.mode) detailBits.push(escapeHtml(info.mode));
+    if (info?.reason) detailBits.push(`load:${escapeHtml(info.reason)}`);
+    if (info?.ms) detailBits.push(`${info.ms}ms`);
+    if (info?.files) detailBits.push(`${info.files} files`);
+    if (info?.method) detailBits.push(`method:${escapeHtml(info.method)}`);
+    if (info?.sourceLabel) detailBits.push(escapeHtml(info.sourceLabel));
+    if (info?.length != null) detailBits.push(`${info.length} chars`);
+    if (info?.error) detailBits.push(`err:${escapeHtml(info.error)}`);
+    if (info?.message) detailBits.push(escapeHtml(String(info.message).slice(0, 80)));
+    return `<div class="site-step ${cls}"><span class="site-step-label">${escapeHtml(label)}</span>${detailBits.length ? `<span class="site-step-detail">${detailBits.join(' · ')}</span>` : ''}</div>`;
 }
 
 function rebuildList() {
@@ -1225,11 +1262,18 @@ function recomputeOutcomeChips() {
     if (pushed + dup + blocked + errors > 0) els.outcomesRow.hidden = false;
 }
 
+// Site-fetch step events arrive BEFORE judge decisions, so we stash the
+// latest step per jobId here and attach it when ingestDecision lands.
+const pendingSiteSteps = new Map(); // jobId → { step, info, ts }
+
 function ingestDecision({ decision, job }) {
+    const pendingStep = pendingSiteSteps.get(decision.id);
     decisionsMap.set(decision.id, {
         decision, job, outcome: null, detail: '', pushing: false,
         selectedPick: !!decision.pick, manualFlip: false,
+        siteStep: pendingStep || null,
     });
+    if (pendingStep) pendingSiteSteps.delete(decision.id);
     ensureSectionVisible();
     rebuildList();
     updatePushButton();
@@ -1896,6 +1940,20 @@ chrome.runtime.onMessage.addListener((msg) => {
                 setLive('Scraping sites', `${msg.done || 0}/${msg.total} site JDs ready · then GPT scores…`);
             }
             break;
+        case 'site-jd-step': {
+            // Per-job phase update from site-jd-fetcher. Fires BEFORE judge
+            // so decisionsMap may not have entry yet — stash in pending.
+            const stepObj = { step: msg.step, info: msg.info || {}, ts: Date.now() };
+            const entry = decisionsMap.get(msg.jobId);
+            if (entry) {
+                entry.siteStep = stepObj;
+                decisionsMap.set(msg.jobId, entry);
+                rebuildList();
+            } else {
+                pendingSiteSteps.set(msg.jobId, stepObj);
+            }
+            break;
+        }
         case 'site-jd-resolved': {
             // Pre-judge site fetch succeeded for one job. Stamp the
             // decision entry's descSource so the source chip flips to
