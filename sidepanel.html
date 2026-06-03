@@ -194,37 +194,7 @@
         <div class="summary-meta" id="summary-meta" hidden></div>
     </section>
 
-    <!-- ============ hiring.cafe MODE (panel opened on hiring.cafe) ============ -->
-    <section class="row hcafe-view" id="hcafe-view" hidden>
-        <div class="hcafe-head">
-            <span class="hcafe-badge">hiring.cafe</span>
-            <span class="hcafe-sub">Backend API scrape — set filters, no scrolling.</span>
-        </div>
-        <div class="hcafe-field">
-            <label for="hcafe-query">Role / keyword</label>
-            <input id="hcafe-query" type="text" placeholder="e.g. software engineer" autocomplete="off">
-        </div>
-        <div class="hcafe-field">
-            <label for="hcafe-country">Country</label>
-            <select id="hcafe-country"></select>
-        </div>
-        <div class="hcafe-field hcafe-inline">
-            <label for="hcafe-past24">
-                <input id="hcafe-past24" type="checkbox" checked> Past 24 hours only
-            </label>
-        </div>
-        <div class="hcafe-field">
-            <label for="hcafe-maxpages">Max pages <small>(~120 jobs each)</small></label>
-            <input id="hcafe-maxpages" type="number" min="1" max="50" step="1" value="5">
-        </div>
-        <div class="hcafe-actions">
-            <button id="hcafe-run" class="primary">Start hiring.cafe run</button>
-            <button id="hcafe-stop" class="hcafe-stop-btn" title="Hard-stop: kills the scrape loop AND judging, including any wedged previous run.">⏹ Stop run</button>
-        </div>
-        <div class="hcafe-status" id="hcafe-status"></div>
-    </section>
-
-    <section class="row actions" id="actions">
+    <section class="row actions">
         <button id="start" class="primary">Start capture</button>
         <button id="judge-now" class="primary" title="Judge any captured-but-unprocessed jobs right now without stopping capture. Use when auto-batch hasn't fired yet (e.g. fewer than batch size unprocessed)." disabled>Judge now</button>
         <button id="judge" class="primary green" disabled>Judge captured</button>
@@ -247,13 +217,6 @@
         </div>
         <div class="stat skip-stat" title="LinkedIn-hosted jobs auto-skipped — operator policy"><span class="label">LinkedIn skipped</span><span id="linkedin-skipped-count" class="big">0</span></div>
         <div class="stat"><span class="label">Active</span><span id="active-state">no</span></div>
-    </section>
-
-    <section class="row stats" id="today-row" title="Today (across all sessions) — server-aggregated">
-        <div class="stat" title="All jobs captured today across all sessions"><span class="label">Today scraped</span><span id="today-captures" class="big">0</span></div>
-        <div class="stat" title="Jobs pushed to dashboard today"><span class="label">Today pushed</span><span id="today-pushed" class="big">0</span></div>
-        <div class="stat" title="Role-mismatch skips today"><span class="label">Today role-miss</span><span id="today-role-miss" class="big">0</span></div>
-        <div class="stat" title="LinkedIn-host skips today"><span class="label">Today LI-skip</span><span id="today-li-skip" class="big">0</span></div>
     </section>
 
     <section class="row progress-section" id="progress-section" hidden>

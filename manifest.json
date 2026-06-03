@@ -1,14 +1,12 @@
 {
   "manifest_version": 3,
   "name": "FlashFire JR → Dashboard Direct",
-  "version": "1.47.0",
-  "description": "Scrape jobright.ai + hiring.cafe job listings, AI-judge in-extension against client profile, push picks straight to FlashFire dashboard.",
+  "version": "1.28.0",
+  "description": "Scrape jobright.ai recommendations from the DOM as you scroll, AI-judge in-extension, hand jobIds to scraper backend for full-JD extraction, push picks straight to FlashFire dashboard.",
   "permissions": ["storage", "activeTab", "tabs", "scripting"],
   "host_permissions": [
     "https://jobright.ai/*",
     "https://*.jobright.ai/*",
-    "https://hiring.cafe/*",
-    "https://*.hiring.cafe/*",
     "https://api.openai.com/*",
     "http://*/*",
     "https://*/*"
@@ -33,23 +31,12 @@
       "js": ["content-scrape.js"],
       "run_at": "document_idle",
       "all_frames": false
-    },
-    {
-      "matches": ["https://hiring.cafe/*", "https://*.hiring.cafe/*"],
-      "js": ["content-scrape-hcafe.js"],
-      "run_at": "document_idle",
-      "all_frames": false
     }
   ],
   "web_accessible_resources": [
     {
       "resources": ["sidepanel.html", "sidepanel.js", "sidepanel.css"],
-      "matches": [
-        "https://jobright.ai/*",
-        "https://*.jobright.ai/*",
-        "https://hiring.cafe/*",
-        "https://*.hiring.cafe/*"
-      ]
+      "matches": ["https://jobright.ai/*", "https://*.jobright.ai/*"]
     }
   ]
 }

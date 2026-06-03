@@ -1039,39 +1039,6 @@ button.ghost.icon { padding: 7px 10px; font-size: 14px; }
 }
 .outcome-chip.pushing { background: rgba(249, 115, 22, 0.15); color: var(--orange); border-color: var(--orange); }
 
-/* JD source chip — shows which platform the JD was scraped from. */
-.src-chip {
-    padding: 2px 8px;
-    border-radius: 999px;
-    font-size: 10px;
-    font-weight: 600;
-    border: 1px solid;
-    letter-spacing: 0.02em;
-}
-.src-chip.src-site { background: rgba(34, 197, 94, 0.10); color: var(--green); border-color: var(--green-dim); }
-.src-chip.src-jr { background: rgba(110, 118, 129, 0.12); color: var(--fg-muted); border-color: var(--fg-muted); }
-.src-chip.src-hcafe { background: rgba(168, 85, 247, 0.12); color: #a855f7; border-color: #a855f7; }
-.src-chip.src-host  { background: rgba(59, 130, 246, 0.10); color: #60a5fa; border-color: #3b82f6; }
-
-/* Site-fetch step ledger — one line per phase, surfaces inline in card. */
-.site-step {
-    display: flex;
-    align-items: baseline;
-    gap: 6px;
-    margin-top: 6px;
-    padding: 4px 8px;
-    border-radius: 4px;
-    font-size: 11px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    border-left: 2px solid;
-}
-.site-step-label { font-weight: 600; flex-shrink: 0; }
-.site-step-detail { color: var(--fg-muted); word-break: break-all; }
-.site-step.site-step-info { background: rgba(59,130,246,0.06);  color: #93c5fd; border-color: #3b82f6; }
-.site-step.site-step-ok   { background: rgba(34,197,94,0.08);   color: #86efac; border-color: var(--green); }
-.site-step.site-step-warn { background: rgba(234,179,8,0.08);   color: #fde68a; border-color: var(--yellow); }
-.site-step.site-step-err  { background: rgba(248,113,113,0.10); color: #fca5a5; border-color: var(--red); }
-
 .empty-state {
     padding: 24px 14px;
     text-align: center;
@@ -1487,51 +1454,3 @@ small.hint code {
 ::-webkit-scrollbar-track { background: var(--bg); }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }
-
-/* ---- hiring.cafe MODE ---- */
-.hcafe-view {
-    flex-direction: column;
-    gap: 10px;
-    align-items: stretch;
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 12px;
-}
-.hcafe-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.hcafe-badge {
-    font-size: 11px; font-weight: 700; letter-spacing: 0.3px;
-    color: #0d1117; background: var(--accent);
-    padding: 2px 8px; border-radius: 999px;
-}
-.hcafe-sub { color: var(--fg-dim); font-size: 11.5px; }
-.hcafe-field { display: flex; flex-direction: column; gap: 4px; }
-.hcafe-field > label { font-size: 11.5px; color: var(--fg-dim); font-weight: 600; }
-.hcafe-field > label small { color: var(--fg-muted); font-weight: 400; }
-.hcafe-field.hcafe-inline > label {
-    flex-direction: row; display: flex; align-items: center; gap: 7px;
-    color: var(--fg); font-size: 12.5px;
-}
-.hcafe-field.hcafe-inline input[type="checkbox"] { width: auto; }
-.hcafe-actions { display: flex; gap: 8px; }
-.hcafe-actions > button { flex: 1; }
-.hcafe-status { font-size: 11.5px; color: var(--fg-dim); min-height: 16px; }
-.hcafe-status.ok { color: var(--green); }
-.hcafe-status.warn { color: var(--yellow); }
-.hcafe-status.error { color: var(--red); }
-
-/* hiring.cafe hard-stop button */
-.hcafe-stop-btn {
-    flex: 1;
-    padding: 8px 12px;
-    background: rgba(248, 113, 113, 0.12);
-    color: var(--red);
-    border: 1px solid var(--red);
-    border-radius: 6px;
-    font: inherit;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s;
-}
-.hcafe-stop-btn:hover { background: rgba(248, 113, 113, 0.22); }
-.hcafe-stop-btn:disabled { opacity: 0.5; cursor: default; }

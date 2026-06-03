@@ -36,35 +36,15 @@
     const apiApplyLinks = new Map();
     const linkedInSkipped = new Set();
 
-    // Hosts whose apply links we refuse to push to the dashboard. Operator
-    // policy: skip generic aggregators (LinkedIn / Dice), employer
-    // career-portal aliases the dashboard already covers (TikTok's
-    // lifeattiktok.com), and specific employers ops asked to exclude
-    // (Dick's Sporting Goods Workday tenant). Add new hostnames to BOTH
-    // regexes — anchored for normal URLs, loose for malformed strings.
-    // Anchored host matches — must equal the hostname or end with the
-    // entry. Use for aggregators (linkedin/dice), career-portal aliases
-    // (lifeattiktok, dataannotation), and SPECIFIC Workday tenants
-    // (humana.wd5.myworkdayjobs.com — does NOT bleed onto other tenants).
-    const BLOCKED_HOST_RX = /(^|\.)(linkedin\.com|dice\.com|indeed\.com|lifeattiktok\.com|dataannotation\.tech|jobs\.apple\.com|humana\.wd5\.myworkdayjobs\.com)$/i;
-    // Substring tokens — fires anywhere in URL/hostname. Use only for
-    // employer-specific blocks where the subdomain pattern varies (e.g.
-    // dickssportinggoods.wd1.myworkdayjobs.com vs dickssportinggoods.com).
-    const BLOCKED_SUBSTRING_RX = /(linkedin\.com|dice\.com|indeed\.com|lifeattiktok\.com|dataannotation\.tech|dickssportinggoods)/i;
-    function isBlockedApplyUrl(url) {
+    function isLinkedInUrl(url) {
         if (!url || typeof url !== 'string') return false;
-        // Substring check first — covers employer-tenant blocks (e.g.
-        // dickssportinggoods on Workday) regardless of how the host is
-        // structured. Hostname check then catches malformed URLs.
-        if (BLOCKED_SUBSTRING_RX.test(url)) return true;
         try {
-            return BLOCKED_HOST_RX.test(new URL(url).hostname);
+            const u = new URL(url);
+            return /(^|\.)linkedin\.com$/i.test(u.hostname);
         } catch {
-            return BLOCKED_SUBSTRING_RX.test(url);
+            return /linkedin\.com/i.test(url);
         }
     }
-    // Legacy name kept as alias so call sites + ticker labels read clean.
-    const isLinkedInUrl = isBlockedApplyUrl;
 
     function ingestApiJobs(jobs) {
         if (!Array.isArray(jobs)) return 0;
@@ -420,24 +400,13 @@
     // chrome.runtime messages from sidepanel → content
     chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         if (!msg || typeof msg !== 'object') return false;
-        if (msg.type === 'jrd-capture-state') {
-            // SW capture state changed (Start/Stop/Reset). JR's scraper is
-            // scroll-driven so we just clear `seen` on Start/Reset — the
-            // virtualised list will re-emit cards as the operator scrolls.
-            if (msg.kind === 'start' || msg.kind === 'reset') {
-                seen.clear();
-                harvestVisible();
-            }
-            sendResponse({ ok: true });
-            return true;
-        }
         if (msg.type === 'jrd-reset-content-cache') {
             seen.clear();
             sendResponse({ ok: true });
             return true;
         }
         if (msg.type === 'jrd-content-stats') {
-            sendResponse({ seen: seen.size, site: 'jobright', captureActive: true, cachedPages: [] });
+            sendResponse({ seen: seen.size });
             return true;
         }
         if (msg.type === 'jrd-toggle-panel') {
