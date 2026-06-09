@@ -215,6 +215,7 @@
         const applyUrl = realApply || `${JR_BASE}/jobs/info/${jobId}`;
         return {
             jobId,
+            source: 'jobright',
             title,
             company,
             industries: pickIndustries(cardEl),

@@ -766,6 +766,31 @@ function scoreClass(score) {
     return 's-low';
 }
 
+// ---- Indeed original-apply-URL cache (localStorage) ---------------------
+// Resolved employer URLs persist across panel reloads so the operator never
+// re-resolves the same job. Keyed by jobId.
+const APPLY_CACHE_KEY = 'ffIndeedApplyUrls';
+function loadApplyCache() {
+    try { return JSON.parse(localStorage.getItem(APPLY_CACHE_KEY) || '{}') || {}; }
+    catch { return {}; }
+}
+function cachedApplyUrl(jobId) {
+    if (!jobId) return '';
+    return loadApplyCache()[jobId] || '';
+}
+function saveApplyUrl(jobId, url) {
+    if (!jobId || !url) return;
+    try {
+        const c = loadApplyCache();
+        c[jobId] = url;
+        localStorage.setItem(APPLY_CACHE_KEY, JSON.stringify(c));
+    } catch { /* quota / disabled — ignore */ }
+}
+// An indeed.com redirect/placeholder URL (not yet the original employer URL).
+function isIndeedRedirectUrl(u) {
+    return /(^|\/\/)([^/]*\.)?indeed\.com\//i.test(String(u || ''));
+}
+
 function renderCard(entry) {
     const { decision, job, outcome, detail, pushing, selectedPick, manualFlip } = entry;
     const card = document.createElement('div');
@@ -802,13 +827,22 @@ function renderCard(entry) {
     }
     if (job.applyUrl) {
         const blocked = String(job.applyUrl).startsWith('__LINKEDIN_BLOCKED__:');
-        const displayUrl = blocked
+        // Prefer a cached/resolved original employer URL over whatever the
+        // job currently carries (which may still be an indeed redirect).
+        const resolved = cachedApplyUrl(decision.id);
+        const rawUrl = blocked
             ? String(job.applyUrl).replace('__LINKEDIN_BLOCKED__:', '')
-            : job.applyUrl;
+            : (resolved || job.applyUrl);
         if (blocked) {
-            actionsHtml += `<a href="${escapeHtml(displayUrl)}" target="_blank" rel="noreferrer" title="LinkedIn-hosted — auto-skipped per policy" style="text-decoration:line-through;color:var(--fg-muted)">View ↗</a>`;
+            actionsHtml += `<a href="${escapeHtml(rawUrl)}" target="_blank" rel="noreferrer" title="LinkedIn-hosted — auto-skipped per policy" style="text-decoration:line-through;color:var(--fg-muted)">View ↗</a>`;
+        } else if (isIndeedRedirectUrl(rawUrl)) {
+            // Still an Indeed redirect — offer to resolve the ORIGINAL
+            // employer URL by opening it in a tab and following the chain.
+            actionsHtml += `<button class="get-original-btn" data-resolve-jobid="${escapeHtml(decision.id)}" title="Open the apply link, follow Indeed's redirect to the company site, and store the original URL">Get original ↗</button>`;
+            actionsHtml += `<a href="${escapeHtml(rawUrl)}" target="_blank" rel="noreferrer" style="color:var(--fg-muted);font-size:11px" title="Indeed redirect link">indeed ↗</a>`;
         } else {
-            actionsHtml += `<a href="${escapeHtml(displayUrl)}" target="_blank" rel="noreferrer">View ↗</a>`;
+            // Resolved employer URL.
+            actionsHtml += `<a href="${escapeHtml(rawUrl)}" target="_blank" rel="noreferrer" title="${escapeHtml(rawUrl)}">View ↗</a>`;
         }
     }
     let outcomeHtml = '';
@@ -1459,6 +1493,34 @@ chrome.runtime.onMessage.addListener((msg) => {
                 setLive('Resolving JDs', `${msg.done || 0}/${msg.total} JDs ready · then GPT scores…`);
             }
             break;
+        case 'jd-extract-start': {
+            const host = (() => {
+                try { return new URL(msg.jobLink || '').hostname.replace(/^www\./, ''); }
+                catch { return msg.source || 'scraper'; }
+            })();
+            const route = msg.route || (msg.source === 'employer' ? '/extract/infor' : '/api/jr/job-detail');
+            pushTickerLine(`→ JD extract sent · ${host} · ${route}`, 'batch');
+            setLive('Extracting JD', `Sending ${host} job page to Playwright scraper…`);
+            break;
+        }
+        case 'jd-extract-result': {
+            const label = [msg.provider, msg.country || msg.location]
+                .filter(Boolean)
+                .join(' · ');
+            const title = msg.title || 'Job';
+            pushTickerLine(`✓ JD extracted · ${title.slice(0, 48)} · ${msg.descLen || 0} chars${label ? ` · ${label}` : ''}`, 'batch');
+            setLive(
+                'JD ready',
+                `${msg.descLen || 0} chars${msg.country ? ` · ${msg.country}` : ''}${msg.provider ? ` · ${msg.provider}` : ''}`,
+                'success',
+            );
+            break;
+        }
+        case 'jd-extract-error': {
+            pushTickerLine(`✗ JD extract failed · ${msg.error || 'ERROR'}${msg.message ? ` · ${String(msg.message).slice(0, 80)}` : ''}`, 'batch');
+            setLive('JD extract failed', msg.error || msg.message || 'Scraper failed', 'error');
+            break;
+        }
         case 'ai-batch-start': handleAiBatchStart(msg); break;
         case 'ai-progress': handleAiProgress(msg); break;
         case 'push-progress': handlePushProgress(msg); break;
@@ -1507,10 +1569,17 @@ chrome.runtime.onMessage.addListener((msg) => {
             }
             break;
         case 'applyurl-resolved': {
+            // Cache only genuine employer URLs (not the indeed fallback) so
+            // the View link survives panel reloads.
+            if (msg.applyUrl && !isIndeedRedirectUrl(msg.applyUrl)) {
+                saveApplyUrl(msg.jobId, msg.applyUrl);
+            }
             const e = decisionsMap.get(msg.jobId);
             if (e?.job) {
                 e.job = { ...e.job, applyUrl: msg.applyUrl };
                 decisionsMap.set(msg.jobId, e);
+                rebuildList();
+            } else {
                 rebuildList();
             }
             break;
@@ -1581,11 +1650,41 @@ els.push.addEventListener('click', runPush);
 els.reset.addEventListener('click', resetCapture);
 
 els.decisionsList.addEventListener('click', (e) => {
-    const btn = e.target.closest('[data-toggle-jobid]');
-    if (!btn) return;
-    e.preventDefault();
-    toggleCardPick(btn.dataset.toggleJobid);
+    const toggle = e.target.closest('[data-toggle-jobid]');
+    if (toggle) {
+        e.preventDefault();
+        toggleCardPick(toggle.dataset.toggleJobid);
+        return;
+    }
+    const resolveBtn = e.target.closest('[data-resolve-jobid]');
+    if (resolveBtn) {
+        e.preventDefault();
+        resolveOriginalUrl(resolveBtn);
+    }
 });
+
+// "Get original ↗" — ask the SW to open the apply link in a tab, follow
+// Indeed's redirect to the employer site, store + show that URL.
+async function resolveOriginalUrl(btn) {
+    const jobId = btn.dataset.resolveJobid;
+    if (!jobId || btn.disabled) return;
+    btn.disabled = true;
+    const prev = btn.textContent;
+    btn.textContent = 'Resolving…';
+    try {
+        const r = await send('jrd-resolve-apply', { jobId });
+        if (r && r.ok && r.applyUrl && !isIndeedRedirectUrl(r.applyUrl)) {
+            saveApplyUrl(jobId, r.applyUrl);
+            rebuildList();
+        } else {
+            btn.textContent = 'No direct URL';
+            setTimeout(() => { btn.textContent = prev; btn.disabled = false; }, 2500);
+        }
+    } catch {
+        btn.textContent = prev;
+        btn.disabled = false;
+    }
+}
 
 els.tabs.forEach((t) => {
     t.addEventListener('click', () => {

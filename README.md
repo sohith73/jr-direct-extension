@@ -1,8 +1,22 @@
-# FlashFire JR → Dashboard Direct (browser extension)
+# FlashFire JR + Indeed → Dashboard Direct (browser extension)
 
-Standalone extension. **Not coupled to the scraper backend.** Speaks
-directly to the FlashFire dashboard API (`/api/clients/all`,
-`/get-profile`, `/addjob`) and to OpenAI (`/v1/chat/completions`).
+One extension, **two platforms**: scrapes both `jobright.ai` and
+`indeed.com`. Speaks directly to the FlashFire dashboard API
+(`/api/clients/all`, `/get-profile`, `/addjob`) and to OpenAI
+(`/v1/chat/completions`).
+
+Per-host content scripts (manifest-scoped — only the matching pair runs):
+
+| Host | Inject (MAIN) | Scrape (ISOLATED) | Full-JD source |
+|---|---|---|---|
+| jobright.ai | `content-inject.js` | `content-scrape.js` | scraper backend (`/api/jr/job-detail`), SSR fallback |
+| indeed.com | `content-inject-indeed.js` | `content-scrape-indeed.js` | in-page `GET <serp>?vjk=<jk>` → `#jobDescriptionText` |
+
+The service worker (`background.js`) is shared: dedup buffer, AI judge, and
+dashboard push are identical for both. `resolveJobDetail()` returns the
+Indeed JD captured in-page (≥200 chars) and otherwise resolves JR jobs via
+the scraper backend. Indeed selectors are verified — see the
+`indeed-serp-scrape-structure` memory.
 
 ## What it does
 

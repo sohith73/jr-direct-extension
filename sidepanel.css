@@ -1430,6 +1430,24 @@ small.hint code {
 .pick-toggle:hover { filter: brightness(1.15); }
 .pick-toggle.locked { opacity: 0.5; cursor: not-allowed; }
 
+.get-original-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+    cursor: pointer;
+    border: 1px solid var(--accent, #2f81f7);
+    background: rgba(47, 129, 247, 0.15);
+    color: var(--accent, #2f81f7);
+    transition: all 0.15s;
+    user-select: none;
+}
+.get-original-btn:hover { filter: brightness(1.2); }
+.get-original-btn:disabled { opacity: 0.6; cursor: progress; }
+
 .decision-card.manual-flip {
     box-shadow: inset 0 0 0 1px var(--yellow);
 }

@@ -1,12 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "FlashFire JR → Dashboard Direct",
-  "version": "1.28.0",
-  "description": "Scrape jobright.ai recommendations from the DOM as you scroll, AI-judge in-extension, hand jobIds to scraper backend for full-JD extraction, push picks straight to FlashFire dashboard.",
+  "name": "FlashFire JR + Indeed → Dashboard Direct",
+  "version": "1.29.0",
+  "description": "Scrape jobright.ai AND Indeed job listings from the DOM as you scroll, AI-judge in-extension against the client summary, and push picks straight to the FlashFire dashboard.",
   "permissions": ["storage", "activeTab", "tabs", "scripting"],
   "host_permissions": [
     "https://jobright.ai/*",
     "https://*.jobright.ai/*",
+    "https://*.indeed.com/*",
+    "https://indeed.com/*",
     "https://api.openai.com/*",
     "http://*/*",
     "https://*/*"
@@ -16,7 +18,7 @@
     "type": "module"
   },
   "action": {
-    "default_title": "Toggle FlashFire JR Panel"
+    "default_title": "Toggle FlashFire Panel (JR + Indeed)"
   },
   "content_scripts": [
     {
@@ -31,12 +33,23 @@
       "js": ["content-scrape.js"],
       "run_at": "document_idle",
       "all_frames": false
+    },
+    {
+      "matches": ["https://*.indeed.com/*", "https://indeed.com/*"],
+      "js": ["content-scrape-indeed.js"],
+      "run_at": "document_idle",
+      "all_frames": false
     }
   ],
   "web_accessible_resources": [
     {
       "resources": ["sidepanel.html", "sidepanel.js", "sidepanel.css"],
-      "matches": ["https://jobright.ai/*", "https://*.jobright.ai/*"]
+      "matches": [
+        "https://jobright.ai/*",
+        "https://*.jobright.ai/*",
+        "https://*.indeed.com/*",
+        "https://indeed.com/*"
+      ]
     }
   ]
 }

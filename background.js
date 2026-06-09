@@ -221,8 +221,9 @@ chrome.runtime.onConnect.addListener((port) => {
 chrome.action.onClicked.addListener(async (tab) => {
     if (!tab?.id) return;
     const url = tab.url || '';
-    if (!/^https?:\/\/([^/]+\.)?jobright\.ai\//.test(url)) {
-        // Not on a JR tab — open one and let the content script auto-mount.
+    if (!/^https?:\/\/([^/]+\.)?(jobright\.ai|indeed\.com)\//.test(url)) {
+        // Not on a supported tab — open JR by default; the operator can
+        // navigate to Indeed themselves (both are supported).
         await chrome.tabs.create({ url: 'https://jobright.ai/jobs/recommend' });
         return;
     }
@@ -291,18 +292,52 @@ function notifyPopup(type, payload) {
 // to start a fresh session.
 const MAX_CAPTURES = 100;
 
+// allowedSourcesForCapture: the per-client scrape-source allowlist
+// ('jobright' / 'indeed') from the selected client's profile. Default is
+// JobRight-only when the client hasn't picked any source — so a client is
+// never scraped from a site the operator didn't enable for them. Set in
+// clients-tracking → AI Summary tab → "Scrape sources".
+function allowedSourcesForCapture() {
+    const raw = state.config.authProfile?.scrapeSources;
+    const list = Array.isArray(raw)
+        ? raw.map((s) => String(s || '').toLowerCase().trim()).filter(Boolean)
+        : [];
+    return list.length ? list : ['jobright'];
+}
+
+// jobSource: which site a captured card came from. Content scripts tag
+// `source` directly ('jobright' / 'indeed'); fall back to field-shape
+// detection for any legacy/in-flight card that predates the tag.
+function jobSource(j) {
+    const s = String(j?.source || '').toLowerCase().trim();
+    if (s === 'jobright' || s === 'indeed') return s;
+    if (j?.jrLink || j?.matchPercent != null || j?.fitFlag) return 'jobright';
+    if (j?.easyApply != null || j?.description != null) return 'indeed';
+    return 'jobright';
+}
+
 function ingestCards(jobs) {
     if (!state.capture.active) return;
     let added = 0;
     let dropped = 0;
+    const allowedSources = allowedSourcesForCapture();
     for (const j of jobs || []) {
         if (!j?.jobId || state.capture.jobs.has(j.jobId)) continue;
+        // Per-client source gating: skip any card from a site this client
+        // isn't enabled for (e.g. Indeed cards when the client is JobRight-only).
+        if (!allowedSources.includes(jobSource(j))) { dropped += 1; continue; }
+        // Indeed: drop Easy Apply (Indeed-hosted) postings — operator wants
+        // only direct company-site jobs. JR jobs have no easyApply field.
+        if (j.easyApply) { dropped += 1; continue; }
         if (state.capture.jobs.size >= MAX_CAPTURES) {
             dropped += 1;
             continue;
         }
         state.capture.jobs.set(j.jobId, j);
         added += 1;
+        // Indeed: kick off async resolution of the applystart redirect →
+        // original employer URL so the panel "View" link shows it directly.
+        if (INDEED_REDIRECT_RX.test(String(j.applyUrl || ''))) enqueueIndeedResolve(j.jobId);
     }
     setBadge(state.capture.jobs.size);
     notifyPopup('count', {
@@ -872,29 +907,413 @@ async function resolveViaScraper(jobId) {
     const base = SCRAPER_BASE_URL.replace(/\/+$/, '');
     let res;
     try {
+        console.log('[FF-JRD] scraper JR detail start', { jobId, url: `${base}/api/jr/job-detail` });
+        notifyPopup('jd-extract-start', {
+            jobId,
+            source: 'jobright',
+            route: '/api/jr/job-detail',
+            jobLink: `https://jobright.ai/jobs/info/${jobId}`,
+        });
         res = await fetch(`${base}/api/jr/job-detail`, {
             method: 'POST',
             headers: { 'content-type': 'application/json', accept: 'application/json' },
             body: JSON.stringify({ jobId }),
         });
     } catch (e) {
+        notifyPopup('jd-extract-error', {
+            jobId,
+            source: 'jobright',
+            error: 'SCRAPER_NETWORK',
+            message: e.message,
+        });
         return { ok: false, error: 'SCRAPER_NETWORK', message: e.message };
     }
     let body = null;
     try { body = await res.json(); } catch { /* non-JSON */ }
     if (!res.ok || !body?.success) {
+        notifyPopup('jd-extract-error', {
+            jobId,
+            source: 'jobright',
+            error: body?.error || `SCRAPER_HTTP_${res.status}`,
+            message: body?.message || `scraper returned ${res.status}`,
+            requestId: body?.requestId || '',
+        });
         return {
             ok: false,
             error: body?.error || `SCRAPER_HTTP_${res.status}`,
             message: body?.message || `scraper returned ${res.status}`,
         };
     }
+    console.log('[FF-JRD] scraper JR detail ok', {
+        jobId,
+        descLen: String(body.description || '').length,
+        applyLink: body.applyLink || '',
+        requestId: body.requestId || '',
+    });
+    notifyPopup('jd-extract-result', {
+        jobId,
+        source: 'jobright',
+        provider: 'jobright',
+        title: body.raw?.title || '',
+        company: body.raw?.company || '',
+        location: body.raw?.location || '',
+        country: '',
+        descLen: String(body.description || '').length,
+        finalUrl: body.applyLink || '',
+        requestId: body.requestId || '',
+    });
     return {
         ok: true,
         applyLink: body.applyLink,
         description: body.description,
         meta: body.raw || {},
     };
+}
+
+function isDirectEmployerUrl(url) {
+    if (!url || typeof url !== 'string') return false;
+    try {
+        const host = new URL(url).hostname;
+        if (/jobright\.ai$/i.test(host)) return false;
+        if (/(^|\.)indeed\./i.test(host)) return false;
+        if (/(^|\.)linkedin\.com$/i.test(host)) return false;
+        return /^https?:/i.test(url);
+    } catch {
+        return false;
+    }
+}
+
+// --- Employer JD extraction: request coalescing -------------------------
+// The pre-judge / pick-resolution workers each call resolveJobLinkViaScraper
+// once per job (up to CONCURRENCY=5 at a time). Rather than fire N separate
+// HTTP GETs at the scraper — where they'd queue behind the 2-page Chromium
+// semaphore — we COALESCE the concurrent calls into ONE
+// POST /api/fetch-jd/batch. The scraper resolves most URLs via Tier-0 (plain
+// HTTP + JSON-LD, no browser) at high concurrency, so a batch of N returns in
+// roughly the time a single browser extraction used to take.
+//
+// Falls back to the legacy single GET /extract/infor when the batch endpoint
+// is missing (older scraper build) so the extension stays compatible.
+const JD_BATCH_WINDOW_MS = 40; // coalescing window — small vs multi-second extraction
+const JD_BATCH_MAX = 25;       // flush early once this many are queued
+const _jdBatch = { queue: [], timer: null };
+
+// Shape one scraper result (single or batch item) into the
+// resolveJobDetail-facing return value + fire the per-job popup event.
+function _shapeEmployerResult(r, jobId, jobLink) {
+    const description = r.mainJd || r.jobDescription || r.description || '';
+    notifyPopup('jd-extract-result', {
+        jobId,
+        source: 'employer',
+        provider: r.provider || '',
+        title: r.title || '',
+        company: r.company || '',
+        location: r.location || '',
+        country: r.country || '',
+        descLen: String(description).length,
+        finalUrl: r.finalUrl || jobLink,
+        requestId: r.requestId || '',
+    });
+    return {
+        ok: true,
+        applyLink: r.finalUrl || jobLink,
+        description,
+        meta: {
+            provider: r.provider || '',
+            title: r.title || '',
+            company: r.company || '',
+            location: r.location || '',
+            country: r.country || '',
+            confidence: r.confidence,
+            method: r.method,
+        },
+    };
+}
+
+function _emitEmployerError(jobId, jobLink, error, message) {
+    notifyPopup('jd-extract-error', { jobId, source: 'employer', jobLink, error, message });
+    return { ok: false, error, message };
+}
+
+// Legacy single-URL path — used as the fallback when /api/fetch-jd/batch is
+// unavailable. Same contract as the batch items.
+async function _singleEmployerExtract(jobId, jobLink) {
+    const base = SCRAPER_BASE_URL.replace(/\/+$/, '');
+    const url = `${base}/extract/infor=${encodeURIComponent(jobLink)}`;
+    let res;
+    try {
+        res = await fetch(url, { method: 'GET', headers: { accept: 'application/json' } });
+    } catch (e) {
+        return _emitEmployerError(jobId, jobLink, 'SCRAPER_NETWORK', e.message);
+    }
+    let body = null;
+    try { body = await res.json(); } catch { /* non-JSON */ }
+    if (!res.ok || !body?.success) {
+        return _emitEmployerError(
+            jobId,
+            jobLink,
+            body?.error || `SCRAPER_HTTP_${res.status}`,
+            body?.message || `scraper returned ${res.status}`,
+        );
+    }
+    return _shapeEmployerResult(body, jobId, jobLink);
+}
+
+async function _flushJdBatch() {
+    if (_jdBatch.timer) { clearTimeout(_jdBatch.timer); _jdBatch.timer = null; }
+    const batch = _jdBatch.queue.splice(0, _jdBatch.queue.length);
+    if (!batch.length) return;
+    const base = SCRAPER_BASE_URL.replace(/\/+$/, '');
+    const urls = batch.map((b) => b.jobLink);
+    console.log('[FF-JRD] scraper employer batch start', { n: batch.length });
+    let res = null;
+    let body = null;
+    try {
+        res = await fetch(`${base}/api/fetch-jd/batch`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', accept: 'application/json' },
+            body: JSON.stringify({ urls }),
+        });
+        try { body = await res.json(); } catch { /* non-JSON */ }
+    } catch (e) {
+        // Network failure — fail every job in the batch (workers fall back to
+        // the JR/source description downstream).
+        for (const b of batch) b.resolve(_emitEmployerError(b.jobId, b.jobLink, 'SCRAPER_NETWORK', e.message));
+        return;
+    }
+    // Batch endpoint missing on this scraper build → fall back to per-job GET.
+    if (res.status === 404 || res.status === 501) {
+        console.warn('[FF-JRD] batch endpoint absent — falling back to single GETs');
+        for (const b of batch) {
+            _singleEmployerExtract(b.jobId, b.jobLink).then(b.resolve);
+        }
+        return;
+    }
+    const results = (body && body.results) || {};
+    for (const b of batch) {
+        const r = results[b.jobLink];
+        if (res.ok && r && r.ok) {
+            b.resolve(_shapeEmployerResult(r, b.jobId, b.jobLink));
+        } else {
+            b.resolve(_emitEmployerError(
+                b.jobId,
+                b.jobLink,
+                (r && r.error) || body?.error || `SCRAPER_HTTP_${res.status}`,
+                (r && r.message) || body?.message || `scraper returned ${res.status}`,
+            ));
+        }
+    }
+}
+
+function resolveJobLinkViaScraper(jobId, jobLink) {
+    if (!isDirectEmployerUrl(jobLink)) return Promise.resolve({ ok: false, error: 'NOT_DIRECT_EMPLOYER' });
+    notifyPopup('jd-extract-start', { jobId, source: 'employer', route: '/api/fetch-jd/batch', jobLink });
+    return new Promise((resolve) => {
+        _jdBatch.queue.push({ jobId, jobLink, resolve });
+        if (_jdBatch.queue.length >= JD_BATCH_MAX) {
+            _flushJdBatch();
+        } else if (!_jdBatch.timer) {
+            _jdBatch.timer = setTimeout(_flushJdBatch, JD_BATCH_WINDOW_MS);
+        }
+    });
+}
+
+// resolveIndeedApplyUrl: Indeed hides the original employer URL behind an
+// `/applystart` (or `/rc/clk`) redirect — the page itself can't follow it
+// (cross-origin → CORS), but the SW can (broad host_permissions). Follow
+// the redirect chain and return the final URL IF it lands off indeed.com
+// (the real employer / ATS site). Returns '' when it stays on indeed.com
+// (Easy Apply form, login wall) or fails — caller falls back to the clean
+// canonical Indeed job URL.
+const indeedApplyCache = new Map(); // jobId -> resolved employer URL ('' = tried, none)
+function isIndeedHost(url) {
+    try { return /(^|\.)indeed\.com$/i.test(new URL(url).hostname); }
+    catch { return false; }
+}
+async function resolveIndeedApplyUrl(seedUrl, jobId) {
+    if (jobId && indeedApplyCache.has(jobId)) return indeedApplyCache.get(jobId);
+    let result = '';
+    if (seedUrl && /indeed\.com\/(applystart|rc\/clk|viewjob|pagead)/i.test(seedUrl)) {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 9000);
+        try {
+            // redirect:'follow' resolves at the final response's headers;
+            // we read res.url only (never the body) to keep it cheap.
+            const res = await fetch(seedUrl, { redirect: 'follow', credentials: 'include', signal: ctrl.signal });
+            const finalUrl = res.url || '';
+            if (finalUrl && !isIndeedHost(finalUrl)) result = finalUrl;
+        } catch (e) {
+            console.warn('[FF-IND] applyUrl resolve failed', jobId, e?.message);
+        } finally {
+            clearTimeout(timer);
+        }
+    } else if (seedUrl && !isIndeedHost(seedUrl)) {
+        result = seedUrl; // already a direct employer URL
+    }
+    if (jobId) indeedApplyCache.set(jobId, result);
+    return result;
+}
+
+// Background resolver queue. As Indeed jobs are captured we resolve their
+// applystart redirect → original employer URL ASAP (throttled), so the
+// panel's "View" link and the eventual push both point at the employer
+// site — not just picks at push time. Falls back to the clean canonical
+// Indeed job URL when the original can't be resolved.
+const indeedResolveQueue = [];
+let indeedResolveActive = 0;
+const INDEED_RESOLVE_CONCURRENCY = 4;
+const INDEED_REDIRECT_RX = /indeed\.com\/(applystart|rc\/clk|pagead)/i;
+
+function enqueueIndeedResolve(jobId) {
+    if (!jobId) return;
+    indeedResolveQueue.push(jobId);
+    pumpIndeedResolve();
+}
+
+function applyResolvedUrl(jobId, finalUrl) {
+    const j = state.capture.jobs.get(jobId);
+    if (j) j.applyUrl = finalUrl;
+    const jj = state.judged?.jobs?.find((x) => x.jobId === jobId);
+    if (jj) jj.applyUrl = finalUrl;
+    if (finalUrl && !isIndeedHost(finalUrl)) indeedApplyCache.set(jobId, finalUrl);
+    notifyPopup('applyurl-resolved', { jobId, applyUrl: finalUrl });
+}
+
+function pumpIndeedResolve() {
+    while (indeedResolveActive < INDEED_RESOLVE_CONCURRENCY && indeedResolveQueue.length) {
+        const jobId = indeedResolveQueue.shift();
+        const job = state.capture.jobs.get(jobId);
+        if (!job) continue;
+        const cur = String(job.applyUrl || '');
+        // Only resolve indeed redirect URLs; skip already-resolved employer
+        // URLs and the canonical viewjob fallback (it won't redirect out).
+        if (!INDEED_REDIRECT_RX.test(cur)) continue;
+        indeedResolveActive += 1;
+        resolveIndeedApplyUrl(cur, jobId)
+            .then((original) => {
+                if (original) {
+                    applyResolvedUrl(jobId, original);
+                } else {
+                    // SW fetch couldn't escape indeed.com (apply interstitial
+                    // / login wall). Fall back to the reliable tab method —
+                    // queued sequentially so we never spawn a tab storm.
+                    enqueueTabResolve(jobId, cur);
+                }
+            })
+            .catch(() => {})
+            .finally(() => {
+                indeedResolveActive -= 1;
+                pumpIndeedResolve();
+            });
+    }
+}
+
+// Sequential tab-resolve queue — at most ONE background tab open at a time.
+const tabResolveQueue = [];
+let tabResolveBusy = false;
+function enqueueTabResolve(jobId, seedUrl) {
+    if (!jobId) return;
+    if (tabResolveQueue.some((q) => q.jobId === jobId)) return;
+    tabResolveQueue.push({ jobId, seedUrl });
+    pumpTabResolve();
+}
+async function pumpTabResolve() {
+    if (tabResolveBusy) return;
+    // Don't pop background tabs while the operator is actively scrolling /
+    // capturing — wait until capture stops, then drain. Re-checks shortly.
+    if (state.capture.active) {
+        setTimeout(pumpTabResolve, 4000);
+        return;
+    }
+    tabResolveBusy = true;
+    try {
+        while (tabResolveQueue.length) {
+            if (state.capture.active) break; // operator resumed — pause
+            const { jobId, seedUrl } = tabResolveQueue.shift();
+            const seed = /indeed\.com\/(applystart|rc\/clk)/i.test(String(seedUrl || ''))
+                ? seedUrl
+                : `https://ca.indeed.com/applystart?jk=${jobId}&from=vj`;
+            const original = await resolveViaTab(seed);
+            applyResolvedUrl(jobId, original || `https://ca.indeed.com/viewjob?jk=${jobId}`);
+        }
+    } finally {
+        tabResolveBusy = false;
+        // Operator resumed capture mid-drain — retry the leftovers later.
+        if (tabResolveQueue.length) setTimeout(pumpTabResolve, 4000);
+    }
+}
+
+// resolveViaTab: the reliable Indeed apply-URL resolver. A background SW
+// `fetch` can be refused / blocked by Indeed's apply interstitial, so this
+// opens the applystart URL in a real (background) browser tab, lets it
+// follow the full redirect chain, grabs the FIRST off-indeed.com URL it
+// lands on (= the employer / ATS site), then closes the tab. Needs the
+// "tabs" permission to read tab.url. Resolves '' on timeout / no escape.
+function resolveViaTab(seedUrl) {
+    return new Promise((resolve) => {
+        let settled = false;
+        let createdTabId = null;
+        const finish = (url) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            try { chrome.tabs.onUpdated.removeListener(onUpdated); } catch {}
+            if (createdTabId != null) { try { chrome.tabs.remove(createdTabId); } catch {} }
+            resolve(url || '');
+        };
+        const onUpdated = (tabId, changeInfo, tab) => {
+            if (tabId !== createdTabId) return;
+            const u = changeInfo.url || (tab && tab.url) || '';
+            if (u && /^https?:/i.test(u) && !isIndeedHost(u)) finish(u);
+        };
+        const timer = setTimeout(() => finish(''), 25000);
+        try {
+            chrome.tabs.onUpdated.addListener(onUpdated);
+            chrome.tabs.create({ url: seedUrl, active: false }, (tab) => {
+                if (chrome.runtime.lastError || !tab) { finish(''); return; }
+                createdTabId = tab.id;
+                // Safety net in case the off-indeed navigation fired before
+                // the listener attached.
+                setTimeout(() => {
+                    if (settled || createdTabId == null) return;
+                    chrome.tabs.get(createdTabId, (t) => {
+                        if (chrome.runtime.lastError || !t) return;
+                        if (t.url && /^https?:/i.test(t.url) && !isIndeedHost(t.url)) finish(t.url);
+                    });
+                }, 1800);
+            });
+        } catch (e) {
+            console.warn('[FF-IND] resolveViaTab threw', e?.message);
+            finish('');
+        }
+    });
+}
+
+// On-demand original-URL resolution for one job (panel "Get original" click).
+async function resolveApplyOnDemand(jobId) {
+    if (!jobId) return { ok: false, error: 'BAD_INPUT' };
+    const job = state.capture.jobs.get(jobId)
+        || (state.judged?.jobs || []).find((x) => x.jobId === jobId);
+    const cur = String(job?.applyUrl || '');
+    // If it's already a resolved employer URL, nothing to do.
+    if (cur && !isIndeedHost(cur)) {
+        return { ok: true, applyUrl: cur, resolved: true, cached: true };
+    }
+    const seed = /indeed\.com\/(applystart|rc\/clk)/i.test(cur)
+        ? cur
+        : `https://ca.indeed.com/applystart?jk=${jobId}&from=vj`;
+    const original = await resolveViaTab(seed);
+    const finalUrl = original || `https://ca.indeed.com/viewjob?jk=${jobId}`;
+    if (original) {
+        const j = state.capture.jobs.get(jobId);
+        if (j) j.applyUrl = original;
+        const jj = state.judged?.jobs?.find((x) => x.jobId === jobId);
+        if (jj) jj.applyUrl = original;
+        indeedApplyCache.set(jobId, original);
+        persistCapture();
+    }
+    notifyPopup('applyurl-resolved', { jobId, applyUrl: finalUrl });
+    return { ok: !!original, applyUrl: finalUrl, resolved: !!original };
 }
 
 // resolveJobDetail: returns the real applyLink + fully-composed
@@ -908,6 +1327,48 @@ async function resolveViaScraper(jobId) {
 //        | { ok:false, error, message }
 async function resolveJobDetail(jobId) {
     if (!jobId) return { ok: false, error: 'BAD_INPUT' };
+    // Indeed path: the content script already fetched the full job
+    // description in-page (via the ?vjk= SERP SSR) and the real applyUrl
+    // came from the mosaic model. No external scraper backend needed — hand
+    // back what was captured. JR jobs have no/short description at capture
+    // time, so they fall through to the JR scraper resolution below.
+    const captured = state.capture.jobs.get(jobId);
+    const capturedApplyUrl = String(captured?.applyUrl || '');
+    if (captured && isDirectEmployerUrl(capturedApplyUrl)) {
+        const capturedDescLen = String(captured.description || '').length;
+        if (capturedDescLen < 1200) {
+            const viaJobLink = await resolveJobLinkViaScraper(jobId, capturedApplyUrl);
+            if (viaJobLink.ok && viaJobLink.description && viaJobLink.description.length >= 200) {
+                applyLinkCache.set(jobId, {
+                    applyLink: viaJobLink.applyLink,
+                    description: viaJobLink.description,
+                    meta: viaJobLink.meta || {},
+                });
+                captured.applyUrl = viaJobLink.applyLink;
+                captured.description = viaJobLink.description;
+                persistCapture();
+                return { ok: true, ...viaJobLink };
+            }
+        }
+    }
+    if (captured && typeof captured.description === 'string' && captured.description.length >= 200) {
+        let applyLink = captured.applyUrl || '';
+        // Indeed: resolve the applystart/clk redirect to the ORIGINAL
+        // employer URL. Fall back to the clean canonical Indeed job URL
+        // when the original can't be resolved (login wall / Easy Apply).
+        if (isIndeedHost(applyLink) || /indeed\.com\/(applystart|rc\/clk)/i.test(applyLink)) {
+            const original = await resolveIndeedApplyUrl(applyLink, jobId);
+            applyLink = original || `https://ca.indeed.com/viewjob?jk=${jobId}`;
+            captured.applyUrl = applyLink; // persist so push reuses it
+        }
+        return {
+            ok: true,
+            applyLink,
+            description: captured.description,
+            meta: {},
+            cached: true,
+        };
+    }
     if (applyLinkCache.has(jobId)) {
         const cached = applyLinkCache.get(jobId);
         if (typeof cached === 'object' && cached.applyLink && cached.description) {
@@ -1028,6 +1489,10 @@ async function resolvePicksAsync() {
                 if (r.description && (!j.description || r.description.length > (j.description || '').length)) {
                     j.description = r.description;
                 }
+                // Employer-site scrape returns the authoritative location
+                // (JSON-LD jobLocation) — prefer it over the JR card text so
+                // the pushed job shows where the role actually is.
+                if (r.meta && r.meta.location) j.location = r.meta.location;
                 if (isLinkedInUrlBg(r.applyLink)) {
                     linkedinDropped += 1;
                     j.applyUrl = `__LINKEDIN_BLOCKED__:${r.applyLink}`;
@@ -1266,7 +1731,60 @@ picks. Empty string for skips. NEVER paraphrase or rename. Use the
 strings exactly as they appear in the hard-signals block.
 
 NEVER write generic reasons like "good fit", "not a match", "see JD",
-"strong alignment". Always be concrete and tight.`;
+"strong alignment". Always be concrete and tight.
+
+GEOGRAPHIC / REGION / LANGUAGE SCOPE (US-work-auth candidates):
+A job whose TITLE signals a non-US country, region, or foreign-language
+market — e.g. "Research Analyst – Japanese Speaking", "Japan Market
+Analyst", "APAC Analyst", "EMEA Analyst", "UK Market Associate", "Canada
+Operations Analyst", or any "<Language>-Speaking" role — is OUT OF SCOPE
+UNLESS the posting clearly confirms a US (or Remote-US) location. When the
+title carries such a keyword and the location/JD does NOT confirm the US,
+set pick=false with skipKind="location-mismatch". Keep the role only when
+the posting confirms a US location. Do not infer US — require it.`;
+
+// ---- geographic / region / language veto --------------------------------
+// US-work-auth candidates must never receive jobs whose TITLE signals a
+// non-US country, region, or foreign-language market UNLESS the posting
+// confirms a US location. Operator policy: "Roles with non-U.S. language,
+// country, or region keywords should not be scraped unless the job page
+// clearly says the location is in the USA." Deterministic backstop for the
+// model — same role as vetoExcluded/vetoQualifierMiss. Conservative: only
+// flips a PICK to skip, only on a clear non-US title token with NO US
+// location confirmation. Never rescues a skip. Generic words like
+// "international"/"global" are intentionally excluded to avoid over-skip.
+const NON_US_TITLE_RE = /\b(japan|japanese|china|chinese|mandarin|cantonese|korea|korean|taiwan|taiwanese|hong\s*kong|singapore|malaysia|indonesia|thailand|thai|vietnam|vietnamese|philippines|filipino|tagalog|apac|emea|latam|anz|uk|u\.k\.|united\s+kingdom|britain|british|england|scotland|ireland|irish|canada|canadian|australia|australian|new\s+zealand|germany|german|france|french|spain|spanish|italy|italian|netherlands|dutch|sweden|swedish|norway|norwegian|denmark|danish|finland|finnish|switzerland|swiss|poland|polish|portugal|portuguese|brazil|brazilian|mexico|mexican|argentina|colombia|chile|peru|dubai|u\.a\.e\.|uae|saudi|qatar|kuwait|bahrain|israel|hebrew|turkey|turkish|egypt|nigeria|nigerian|kenya|south\s+africa|russia|russian|ukraine|ukrainian|hindi|tamil|telugu|arabic|nordic|benelux|iberia|gcc|mena|india|indian)\b/i;
+// "<language>-speaking" / "<language> speaking" pattern (bilingual market roles).
+const LANG_SPEAKING_RE = /\b[a-z]{3,}[-\s]speaking\b/i;
+// US-location confirmation. Names + "USA / United States / Remote US" plus
+// the canonical "City, ST" abbrev form (comma-anchored so prepositions like
+// "in"/"or" and the word "us" can't false-confirm). Scanned over location;
+// JD only via the strong phrase regex below.
+const US_LOC_NAME_RE = /\b(usa|u\.s\.a|united\s+states|us\s+remote|remote[\s,–-]+us|alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new\s+hampshire|new\s+jersey|new\s+mexico|new\s+york|north\s+carolina|north\s+dakota|ohio|oklahoma|oregon|pennsylvania|rhode\s+island|south\s+carolina|south\s+dakota|tennessee|texas|utah|vermont|virginia|washington|west\s+virginia|wisconsin|wyoming)\b/i;
+const US_STATE_ABBREV_RE = /,\s*(a[klzr]|c[aot]|d[ce]|fl|ga|hi|i[adln]|k[sy]|la|m[adeinost]|n[cdehjmvy]|o[hkr]|pa|ri|s[cd]|t[nx]|ut|v[at]|w[aivy])\b/i;
+const US_JD_STRONG_RE = /\b(united\s+states|usa|u\.s\.a|us-based|based\s+in\s+the\s+us)\b/i;
+function geoConfirmsUS(job) {
+    const loc = String(job?.location || '').toLowerCase();
+    if (loc && (US_LOC_NAME_RE.test(loc) || US_STATE_ABBREV_RE.test(loc))) return true;
+    const jd = String(job?.description || job?.matchSummary || '').toLowerCase();
+    if (jd && US_JD_STRONG_RE.test(jd)) return true;
+    return false;
+}
+function vetoGeoRegion(decision, job) {
+    if (!decision.pick) return decision;
+    const title = String(job?.title || '');
+    const m = title.match(NON_US_TITLE_RE) || title.match(LANG_SPEAKING_RE);
+    if (!m) return decision;                     // no non-US title signal
+    if (geoConfirmsUS(job)) return decision;     // US location confirmed → keep
+    const tok = m[0];
+    return {
+        ...decision,
+        pick: false,
+        skipKind: 'location-mismatch',
+        matchedRole: '',
+        reason: `Skip — title "${title}" signals a non-US market ("${tok}") and no US location is confirmed; out of US scope. (Auto-vetoed; AI scored ${decision.score}.)`,
+    };
+}
 
 function buildUserPrompt({ profile, jobs, threshold, aiSummary }) {
     // Hard-signals block ALWAYS goes in, even when an aiSummary exists. The
@@ -1390,6 +1908,9 @@ async function resolvePreJudge(jobs, { concurrency = 5 } = {}) {
                 const r = await resolveJobDetail(j.jobId);
                 if (r.ok && r.description && r.description.length > 200) {
                     j.description = r.description;
+                    // Employer-site scrape returns the authoritative location
+                    // (JSON-LD jobLocation) — prefer it over the JR card text.
+                    if (r.meta && r.meta.location) j.location = r.meta.location;
                     // Don't overwrite applyUrl here — auto-pipeline does it
                     // post-judge to keep the resolve-vs-judge boundary clean.
                     resolved += 1;
@@ -1819,9 +2340,12 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
             //   1. excludedRoles veto — explicit opt-out by the client.
             //   2. qualifier-miss veto — title doesn't contain any preferred
             //      discipline qualifier (Data, Business Intelligence, etc.).
-            // Both are no-ops when their token sets are empty.
+            //   3. geo-region veto — title signals a non-US country/region/
+            //      language market and no US location is confirmed.
+            // All are no-ops when nothing matches.
             norm = vetoExcluded(norm, job);
             norm = vetoQualifierMiss(norm, job);
+            norm = vetoGeoRegion(norm, job);
             decisions.push(norm);
             // Stream each judged job into the side panel so the operator
             // sees reasoning in real time, not just at the end.
@@ -2316,7 +2840,12 @@ async function pushSelected({ jobIds }) {
                     });
                     continue;
                 }
-                if (JR_FALLBACK_RX.test(String(j.applyUrl || ''))) {
+                // Overwrite when the captured URL is a placeholder/redirect:
+                //   • JR fallback `/jobs/info/<id>`
+                //   • any indeed.com URL (applystart/clk/viewjob) → replace
+                //     with the resolved original employer URL.
+                const cur = String(j.applyUrl || '');
+                if (JR_FALLBACK_RX.test(cur) || /(^|\.)indeed\.com/i.test(cur)) {
                     j.applyUrl = detail.applyLink;
                     notifyPopup('applyurl-resolved', { jobId: j.jobId, applyUrl: detail.applyLink });
                 }
@@ -2513,6 +3042,13 @@ function dispatchMessage(msg, _sender, sendResponse) {
         return false;
     }
 
+    if (msg.type === 'jrd-resolve-apply') {
+        resolveApplyOnDemand(msg.jobId)
+            .then((r) => sendResponse(r))
+            .catch((e) => sendResponse({ ok: false, error: 'UNEXPECTED', message: e?.message || String(e) }));
+        return true;
+    }
+
     if (msg.type === 'jrd-state') {
         sendResponse({
             config: state.config,
@@ -2613,7 +3149,7 @@ function dispatchMessage(msg, _sender, sendResponse) {
         // Tell content script to clear its in-page cache so a re-scroll
         // re-emits cards instead of the de-dup squelching them.
         chrome.tabs
-            .query({ url: ['https://jobright.ai/*', 'https://*.jobright.ai/*'] })
+            .query({ url: ['https://jobright.ai/*', 'https://*.jobright.ai/*', 'https://*.indeed.com/*', 'https://indeed.com/*'] })
             .then((tabs) => {
                 for (const t of tabs) {
                     chrome.tabs

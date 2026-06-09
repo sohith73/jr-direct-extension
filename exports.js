@@ -34,6 +34,7 @@ export const API_ENDPOINTS = {
 // API paths on the scraper backend (Playwright job-detail extractor).
 export const SCRAPER_ENDPOINTS = {
     JOB_DETAIL: '/api/jr/job-detail',
+    EXTRACT_INFO: '/extract/infor=',
 };
 
 // Fully-qualified URLs — usually pulled from these instead of joining at
@@ -46,4 +47,5 @@ export const API_URLS = {
     BUILD_AI_SUMMARY: `${API_BASE_URL}${API_ENDPOINTS.BUILD_AI_SUMMARY}`,
     UPDATE_AI_SUMMARY: `${API_BASE_URL}${API_ENDPOINTS.UPDATE_AI_SUMMARY}`,
     SCRAPER_JOB_DETAIL: `${SCRAPER_BASE_URL}${SCRAPER_ENDPOINTS.JOB_DETAIL}`,
+    SCRAPER_EXTRACT_INFO: `${SCRAPER_BASE_URL}${SCRAPER_ENDPOINTS.EXTRACT_INFO}`,
 };
