@@ -76,6 +76,14 @@ const state = {
         profile: null,
         aiSummary: '',
         stats: { judged: 0, picks: 0, pushed: 0, dupes: 0, blocked: 0, errors: 0, skipsByKind: {} },
+        // Circuit breaker for the judge step. A persistently-failing OpenAI
+        // call (offline, bad key, rate-limit) used to loop forever because the
+        // finally-block re-armed tryAutoBatch at 0ms. Count consecutive
+        // failures; after AUTO_JUDGE_MAX_FAILS, halt auto-judging and tell the
+        // operator instead of hammering the API thousands of times.
+        judgeFailStreak: 0,
+        halted: false,
+        haltedReason: '',
         // Hard stop. Flips true on first server TARGET_REACHED reply OR
         // when /push-history reports remaining=0. While true the SW refuses
         // to fire new batches, refuses individual pushes, and auto-stops
@@ -291,6 +299,8 @@ function notifyPopup(type, payload) {
 // auto-pipeline finishes the existing buffer cleanly. Operator can Reset
 // to start a fresh session.
 const MAX_CAPTURES = 100;
+const AUTO_JUDGE_MAX_FAILS = 3; // consecutive judge failures before halting auto-pipeline
+const AUTO_MIN_JD_LEN = 80;     // Indeed jobs with a shorter JD are skipped, not added
 
 // allowedSourcesForCapture: the per-client scrape-source allowlist
 // ('jobright' / 'indeed') from the selected client's profile. Default is
@@ -316,16 +326,37 @@ function jobSource(j) {
     return 'jobright';
 }
 
+// cleanJdText: regex safety net for Indeed descriptions (the SW has no DOM, so
+// it can't use cleanFromNode). Indeed's styled-components leak inline <style>
+// CSS into the scraped text; strip tags + CSS blocks so the judge and the
+// dashboard get plain JD text only.
+function cleanJdText(s) {
+    let t = String(s || '');
+    if (!t) return '';
+    t = t.replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<script[\s\S]*?<\/script>/gi, ' ');
+    t = t.replace(/<[^>]+>/g, ' ');                 // strip any remaining tags
+    // Trim to the real JD first so the CSS strip below can't eat prose between
+    // leaked rule blocks.
+    const idx = t.toLowerCase().lastIndexOf('full job description');
+    if (idx !== -1) t = t.slice(idx + 'full job description'.length);
+    t = t.replace(/\{[^{}]*\}/g, ' ');               // CSS declaration blocks
+    t = t.replace(/(?:body\s+)?\.?[\w-]*(?:css-|serp-page-|js-match-insights[\w-]*|ifl-)[\w-]*/gi, ' '); // selector/var tokens
+    t = t.replace(/--[\w-]+/g, ' ');
+    return t.replace(/&nbsp;| /g, ' ').replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 function ingestCards(jobs) {
     if (!state.capture.active) return;
     let added = 0;
     let dropped = 0;
+    let sourceBlocked = 0;        // cards dropped purely because the client
+    let blockedSrc = '';          // doesn't allow this site's source
     const allowedSources = allowedSourcesForCapture();
     for (const j of jobs || []) {
         if (!j?.jobId || state.capture.jobs.has(j.jobId)) continue;
         // Per-client source gating: skip any card from a site this client
         // isn't enabled for (e.g. Indeed cards when the client is JobRight-only).
-        if (!allowedSources.includes(jobSource(j))) { dropped += 1; continue; }
+        if (!allowedSources.includes(jobSource(j))) { dropped += 1; sourceBlocked += 1; blockedSrc = jobSource(j); continue; }
         // Indeed: drop Easy Apply (Indeed-hosted) postings — operator wants
         // only direct company-site jobs. JR jobs have no easyApply field.
         if (j.easyApply) { dropped += 1; continue; }
@@ -333,6 +364,9 @@ function ingestCards(jobs) {
             dropped += 1;
             continue;
         }
+        // Indeed JD can carry leaked styled-components CSS — scrub to plain
+        // text before storing so the judge + dashboard never see HTML/CSS.
+        if (jobSource(j) === 'indeed' && j.description) j.description = cleanJdText(j.description);
         state.capture.jobs.set(j.jobId, j);
         added += 1;
         // Indeed: kick off async resolution of the applystart redirect →
@@ -347,6 +381,11 @@ function ingestCards(jobs) {
         cap: MAX_CAPTURES,
         atCap: state.capture.jobs.size >= MAX_CAPTURES,
     });
+    // This client isn't enabled for the site being scraped — every card here
+    // was silently dropped. Tell the operator instead of showing a dead "0".
+    if (sourceBlocked > 0 && added === 0) {
+        notifyPopup('source-blocked', { source: blockedSrc, allowed: allowedSources, dropped: sourceBlocked });
+    }
     if (state.capture.jobs.size >= MAX_CAPTURES) {
         // Reaching cap auto-stops capture so the pipeline drains and the
         // operator gets a clean "session done" signal.
@@ -903,6 +942,20 @@ function composeJobDescription(jr) {
 // the JR detail page on our behalf. The persistent context is reliably
 // authenticated, so this returns full JD + real applyLink even when the
 // extension's own SW fetch would lose third-party cookies.
+// fetchWithTimeout — fetch that aborts after `ms`. A hung scraper request
+// (slow/unreachable employer site) must never stall the capture/judge
+// pipeline — that was the "7/8 JDs ready" freeze. On timeout the AbortError
+// surfaces in the caller's catch, which already falls back to the source JD.
+async function fetchWithTimeout(url, options = {}, ms = 20000) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), ms);
+    try {
+        return await fetch(url, { ...options, signal: ctrl.signal });
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 async function resolveViaScraper(jobId) {
     const base = SCRAPER_BASE_URL.replace(/\/+$/, '');
     let res;
@@ -914,11 +967,11 @@ async function resolveViaScraper(jobId) {
             route: '/api/jr/job-detail',
             jobLink: `https://jobright.ai/jobs/info/${jobId}`,
         });
-        res = await fetch(`${base}/api/jr/job-detail`, {
+        res = await fetchWithTimeout(`${base}/api/jr/job-detail`, {
             method: 'POST',
             headers: { 'content-type': 'application/json', accept: 'application/json' },
             body: JSON.stringify({ jobId }),
-        });
+        }, 20000);
     } catch (e) {
         notifyPopup('jd-extract-error', {
             jobId,
@@ -1042,7 +1095,7 @@ async function _singleEmployerExtract(jobId, jobLink) {
     const url = `${base}/extract/infor=${encodeURIComponent(jobLink)}`;
     let res;
     try {
-        res = await fetch(url, { method: 'GET', headers: { accept: 'application/json' } });
+        res = await fetchWithTimeout(url, { method: 'GET', headers: { accept: 'application/json' } }, 25000);
     } catch (e) {
         return _emitEmployerError(jobId, jobLink, 'SCRAPER_NETWORK', e.message);
     }
@@ -1069,11 +1122,11 @@ async function _flushJdBatch() {
     let res = null;
     let body = null;
     try {
-        res = await fetch(`${base}/api/fetch-jd/batch`, {
+        res = await fetchWithTimeout(`${base}/api/fetch-jd/batch`, {
             method: 'POST',
             headers: { 'content-type': 'application/json', accept: 'application/json' },
             body: JSON.stringify({ urls }),
-        });
+        }, 30000);
         try { body = await res.json(); } catch { /* non-JSON */ }
     } catch (e) {
         // Network failure — fail every job in the batch (workers fall back to
@@ -1334,6 +1387,19 @@ async function resolveJobDetail(jobId) {
     // time, so they fall through to the JR scraper resolution below.
     const captured = state.capture.jobs.get(jobId);
     const capturedApplyUrl = String(captured?.applyUrl || '');
+    // Indeed is fully self-contained: the content script already scraped the
+    // full JD in-page (?vjk= SSR). Resolve the applystart redirect → employer
+    // URL here and hand back the captured JD. Never route Indeed through the
+    // JR scraper (wrong jobId space) — do it from Indeed itself.
+    if (captured && captured.source === 'indeed') {
+        let applyLink = capturedApplyUrl;
+        if (isIndeedHost(applyLink) || /indeed\.com\/(applystart|rc\/clk|pagead)/i.test(applyLink)) {
+            const original = await resolveIndeedApplyUrl(applyLink, jobId);
+            applyLink = original || applyLink; // stays indeed if unresolved → push layer blocks it
+            captured.applyUrl = applyLink;
+        }
+        return { ok: true, applyLink, description: String(captured.description || ''), meta: {}, cached: true };
+    }
     if (captured && isDirectEmployerUrl(capturedApplyUrl)) {
         const capturedDescLen = String(captured.description || '').length;
         if (capturedDescLen < 1200) {
@@ -1541,6 +1607,11 @@ async function pushJob({ job, clientEmail, clientName }) {
             errorDetail: `missing required fields title=${!!title} company=${!!company} joblink=${!!joblink}`,
         };
     }
+    // Hard guard — never let an indeed.com link reach the dashboard, whatever
+    // path got here (auto or manual). Employer URL must have resolved first.
+    if (/indeed\.com/i.test(joblink)) {
+        return { ok: false, status: 0, error: 'INDEED_URL', errorDetail: 'Indeed apply URL blocked — employer link not resolved' };
+    }
     const payload = {
         jobDetails: {
             userID: email,
@@ -1560,6 +1631,10 @@ async function pushJob({ job, clientEmail, clientName }) {
         // 5-digit operator code identifies WHICH human operator pushed.
         // Backend resolves it to addedBy / extensionCode on the JobModel.
         extensionCode: state.config.extensionCode || '',
+        // Marks this as a stage-one (JR-description-only) push so the backend
+        // queues it for second-stage screening (secondJudgeWorker re-judges the
+        // real employer-site text against the client profile).
+        source: 'jr-direct-extension',
     };
     console.log('[FF-JRD] /addjob →', {
         jobTitle: title,
@@ -1733,27 +1808,38 @@ strings exactly as they appear in the hard-signals block.
 NEVER write generic reasons like "good fit", "not a match", "see JD",
 "strong alignment". Always be concrete and tight.
 
-GEOGRAPHIC / REGION / LANGUAGE SCOPE (US-work-auth candidates):
-A job whose TITLE signals a non-US country, region, or foreign-language
-market — e.g. "Research Analyst – Japanese Speaking", "Japan Market
-Analyst", "APAC Analyst", "EMEA Analyst", "UK Market Associate", "Canada
-Operations Analyst", or any "<Language>-Speaking" role — is OUT OF SCOPE
-UNLESS the posting clearly confirms a US (or Remote-US) location. When the
-title carries such a keyword and the location/JD does NOT confirm the US,
-set pick=false with skipKind="location-mismatch". Keep the role only when
-the posting confirms a US location. Do not infer US — require it.`;
+GEOGRAPHIC / REGION / LANGUAGE SCOPE:
+The "## Candidate hard signals" block carries the client's home country
+(from preferredLocations + work authorisation) — usually the US or Canada.
+A job whose TITLE signals a market OUTSIDE that home country, region, or a
+foreign-language market — e.g. "Research Analyst – Japanese Speaking",
+"Japan Market Analyst", "APAC Analyst", "EMEA Analyst", "UK Market
+Associate", or any "<Language>-Speaking" role — is OUT OF SCOPE UNLESS the
+posting clearly confirms a location in the client's home country (or its
+Remote variant). For a US client, Canada titles are out of scope; for a
+Canada client, US titles are out of scope; overseas titles are out of scope
+for both. When the title carries such a keyword and the location/JD does NOT
+confirm a home-country location, set pick=false with
+skipKind="location-mismatch". Do not infer the location — require it.`;
 
 // ---- geographic / region / language veto --------------------------------
-// US-work-auth candidates must never receive jobs whose TITLE signals a
-// non-US country, region, or foreign-language market UNLESS the posting
-// confirms a US location. Operator policy: "Roles with non-U.S. language,
-// country, or region keywords should not be scraped unless the job page
-// clearly says the location is in the USA." Deterministic backstop for the
-// model — same role as vetoExcluded/vetoQualifierMiss. Conservative: only
-// flips a PICK to skip, only on a clear non-US title token with NO US
-// location confirmation. Never rescues a skip. Generic words like
-// "international"/"global" are intentionally excluded to avoid over-skip.
-const NON_US_TITLE_RE = /\b(japan|japanese|china|chinese|mandarin|cantonese|korea|korean|taiwan|taiwanese|hong\s*kong|singapore|malaysia|indonesia|thailand|thai|vietnam|vietnamese|philippines|filipino|tagalog|apac|emea|latam|anz|uk|u\.k\.|united\s+kingdom|britain|british|england|scotland|ireland|irish|canada|canadian|australia|australian|new\s+zealand|germany|german|france|french|spain|spanish|italy|italian|netherlands|dutch|sweden|swedish|norway|norwegian|denmark|danish|finland|finnish|switzerland|swiss|poland|polish|portugal|portuguese|brazil|brazilian|mexico|mexican|argentina|colombia|chile|peru|dubai|u\.a\.e\.|uae|saudi|qatar|kuwait|bahrain|israel|hebrew|turkey|turkish|egypt|nigeria|nigerian|kenya|south\s+africa|russia|russian|ukraine|ukrainian|hindi|tamil|telugu|arabic|nordic|benelux|iberia|gcc|mena|india|indian)\b/i;
+// A candidate should never receive jobs whose TITLE signals a market OUTSIDE
+// their home country UNLESS the posting confirms a home-country location.
+// The home market is per-client (US, Canada, or both) — derived from the
+// profile's preferred locations + work authorisation — so a Canadian client
+// keeps Canada jobs while a US client skips them, and vice-versa. Operator
+// policy: "Roles with non-home-country language/country/region keywords
+// should not be scraped unless the job page clearly says the location is in
+// the client's country." Deterministic backstop for the model — same role as
+// vetoExcluded/vetoQualifierMiss. Conservative: only flips a PICK to skip, on
+// a clear foreign-market title token with NO home-location confirmation.
+// Never rescues a skip. Generic words ("international"/"global") are excluded.
+//
+// Overseas markets — always foreign to North America (US + Canada). Canada
+// and US tokens are handled separately below so they flip per home market.
+const FOREIGN_TITLE_RE = /\b(japan|japanese|china|chinese|mandarin|cantonese|korea|korean|taiwan|taiwanese|hong\s*kong|singapore|malaysia|indonesia|thailand|thai|vietnam|vietnamese|philippines|filipino|tagalog|apac|emea|latam|anz|uk|u\.k\.|united\s+kingdom|britain|british|england|scotland|ireland|irish|australia|australian|new\s+zealand|germany|german|france|french|spain|spanish|italy|italian|netherlands|dutch|sweden|swedish|norway|norwegian|denmark|danish|finland|finnish|switzerland|swiss|poland|polish|portugal|portuguese|brazil|brazilian|mexico|mexican|argentina|colombia|chile|peru|dubai|u\.a\.e\.|uae|saudi|qatar|kuwait|bahrain|israel|hebrew|turkey|turkish|egypt|nigeria|nigerian|kenya|south\s+africa|russia|russian|ukraine|ukrainian|hindi|tamil|telugu|arabic|nordic|benelux|iberia|gcc|mena|india|indian)\b/i;
+const CA_TITLE_RE = /\b(canada|canadian)\b/i;
+const US_TITLE_RE = /\b(usa|u\.s\.a|united\s+states|u\.s\.)\b/i;
 // "<language>-speaking" / "<language> speaking" pattern (bilingual market roles).
 const LANG_SPEAKING_RE = /\b[a-z]{3,}[-\s]speaking\b/i;
 // US-location confirmation. Names + "USA / United States / Remote US" plus
@@ -1763,27 +1849,159 @@ const LANG_SPEAKING_RE = /\b[a-z]{3,}[-\s]speaking\b/i;
 const US_LOC_NAME_RE = /\b(usa|u\.s\.a|united\s+states|us\s+remote|remote[\s,–-]+us|alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new\s+hampshire|new\s+jersey|new\s+mexico|new\s+york|north\s+carolina|north\s+dakota|ohio|oklahoma|oregon|pennsylvania|rhode\s+island|south\s+carolina|south\s+dakota|tennessee|texas|utah|vermont|virginia|washington|west\s+virginia|wisconsin|wyoming)\b/i;
 const US_STATE_ABBREV_RE = /,\s*(a[klzr]|c[aot]|d[ce]|fl|ga|hi|i[adln]|k[sy]|la|m[adeinost]|n[cdehjmvy]|o[hkr]|pa|ri|s[cd]|t[nx]|ut|v[at]|w[aivy])\b/i;
 const US_JD_STRONG_RE = /\b(united\s+states|usa|u\.s\.a|us-based|based\s+in\s+the\s+us)\b/i;
-function geoConfirmsUS(job) {
+// Canada-location confirmation. Country/province names + major cities +
+// "Remote Canada", plus the canonical "City, PROV" 2-letter form (comma-
+// anchored, same anti-false-positive guard as the US abbrevs).
+const CA_LOC_NAME_RE = /\b(canada|canadian|remote\s+canada|canada\s+remote|ontario|quebec|québec|british\s+columbia|alberta|manitoba|saskatchewan|nova\s+scotia|new\s+brunswick|newfoundland|labrador|prince\s+edward\s+island|yukon|nunavut|northwest\s+territories|toronto|vancouver|montreal|montréal|calgary|ottawa|edmonton|winnipeg|mississauga|hamilton|halifax|victoria|waterloo|kitchener|burnaby|markham|brampton)\b/i;
+const CA_PROV_ABBREV_RE = /,\s*(on|qc|bc|ab|mb|sk|ns|nb|nl|pe|yt|nt|nu)\b/i;
+const CA_JD_STRONG_RE = /\b(canada|canadian|based\s+in\s+canada|canada-based)\b/i;
+
+// homeMarkets: which country market(s) this client targets — Set of 'us'
+// and/or 'ca'. Derived from preferred locations + work authorisation. Falls
+// back to ['us'] when nothing is detectable (back-compat with the original
+// US-only behaviour). Both → only overseas titles are ever skipped.
+function homeMarkets(profile) {
+    const parts = [];
+    const pl = profile?.preferredLocations;
+    if (Array.isArray(pl)) parts.push(pl.join(', '));
+    else if (typeof pl === 'string') parts.push(pl);
+    parts.push(String(profile?.workAuthorization || ''));
+    parts.push(String(profile?.usWorkEligibility || ''));
+    parts.push(String(profile?.visaStatus || ''));
+    parts.push(String(profile?.country || ''));
+    const hay = parts.join(' ; ').toLowerCase();
+    const markets = new Set();
+    if (
+        /\b(f-?1|opt|cpt|h-?1b|green\s+card|ead|u\.?s\.?\s+citizen|us\s+work|usa|united\s+states)\b/.test(hay) ||
+        US_LOC_NAME_RE.test(hay) || US_STATE_ABBREV_RE.test(hay)
+    ) markets.add('us');
+    if (
+        /\b(canadian|pgwp|open\s+work\s+permit|citizen\s+of\s+canada)\b/.test(hay) ||
+        CA_LOC_NAME_RE.test(hay) || CA_PROV_ABBREV_RE.test(hay)
+    ) markets.add('ca');
+    if (markets.size === 0) markets.add('us');
+    return markets;
+}
+
+// geoConfirmsHome: does the posting's location/JD confirm a location inside
+// ANY of the client's home markets?
+function geoConfirmsHome(job, markets) {
     const loc = String(job?.location || '').toLowerCase();
-    if (loc && (US_LOC_NAME_RE.test(loc) || US_STATE_ABBREV_RE.test(loc))) return true;
     const jd = String(job?.description || job?.matchSummary || '').toLowerCase();
-    if (jd && US_JD_STRONG_RE.test(jd)) return true;
+    if (markets.has('us')) {
+        if (loc && (US_LOC_NAME_RE.test(loc) || US_STATE_ABBREV_RE.test(loc))) return true;
+        if (jd && US_JD_STRONG_RE.test(jd)) return true;
+    }
+    if (markets.has('ca')) {
+        if (loc && (CA_LOC_NAME_RE.test(loc) || CA_PROV_ABBREV_RE.test(loc))) return true;
+        if (jd && CA_JD_STRONG_RE.test(jd)) return true;
+    }
     return false;
 }
-function vetoGeoRegion(decision, job) {
+
+function vetoGeoRegion(decision, job, markets) {
     if (!decision.pick) return decision;
+    const home = markets && markets.size ? markets : new Set(['us']);
     const title = String(job?.title || '');
-    const m = title.match(NON_US_TITLE_RE) || title.match(LANG_SPEAKING_RE);
-    if (!m) return decision;                     // no non-US title signal
-    if (geoConfirmsUS(job)) return decision;     // US location confirmed → keep
+    // Foreign-market title signal RELATIVE to the client's home market(s):
+    //  - always-foreign overseas tokens + "<lang>-speaking"
+    //  - Canada tokens are foreign only for a non-Canada client
+    //  - US tokens are foreign only for a non-US client
+    let m = title.match(FOREIGN_TITLE_RE) || title.match(LANG_SPEAKING_RE);
+    if (!m && !home.has('ca')) m = title.match(CA_TITLE_RE);
+    if (!m && !home.has('us')) m = title.match(US_TITLE_RE);
+    if (!m) return decision;                          // no foreign-market signal
+    if (geoConfirmsHome(job, home)) return decision;  // home-country location confirmed → keep
     const tok = m[0];
+    const where = [...home].map((x) => x.toUpperCase()).join('/');
     return {
         ...decision,
         pick: false,
         skipKind: 'location-mismatch',
         matchedRole: '',
-        reason: `Skip — title "${title}" signals a non-US market ("${tok}") and no US location is confirmed; out of US scope. (Auto-vetoed; AI scored ${decision.score}.)`,
+        reason: `Skip — title "${title}" signals a market ("${tok}") outside the client's ${where} scope and no ${where} location is confirmed. (Auto-vetoed; AI scored ${decision.score}.)`,
     };
+}
+
+// ---- generic operator-note exclusion veto -------------------------------
+// The operator types free-text directives per client in "Notes to AI"
+// (e.g. "Do not scrap JP Morgan Chase", "Do not scrap sales or business
+// development", "DO NOT SCRAP ANY SALES ROLE"). Those land as "Skip ..."
+// bullets in the candidate brief's Hard Disqualifiers section. The LLM is
+// told to honour them, but we don't trust it 100% — this builds a token
+// list from BOTH the raw per-client notes AND the summary's disqualifier
+// bullets, then deterministically flips any pick whose title/company hits a
+// token. Generic: every client's notes work without per-client code.
+
+// Job-listing nouns + filler that aren't part of the thing being excluded.
+const NOTE_NOUN_STRIP_RE = /\b(?:job\s*postings?|postings?|jobs?|roles?|positions?|openings?|listings?|titles?|companies|company|firms?|agency|agencies|recruiters?|all|any)\b/gi;
+// Subordinate/reason clauses to cut off the tail ("...since the client...").
+const NOTE_CLAUSE_CUT_RE = /\b(?:since|because|as the client|as client|so that|so we|so they|unless|except|–|—|--).*$/i;
+// Tokens too generic to match on (would over-skip).
+const NOTE_STOPWORDS = new Set([
+    'job', 'jobs', 'role', 'roles', 'position', 'positions', 'this', 'that',
+    'these', 'those', 'them', 'only', 'looking', 'client', 'the', 'and', 'or',
+    'with', 'for', 'from', 'work', 'remote', 'onsite', 'hybrid', 'full', 'time',
+]);
+function splitNoteObject(obj) {
+    const out = [];
+    const cleaned = String(obj || '')
+        .replace(NOTE_CLAUSE_CUT_RE, '')
+        .replace(NOTE_NOUN_STRIP_RE, ' ')
+        .replace(/^[\s,.:;–—-]+|[\s,.:;–—-]+$/g, '')
+        .replace(/\s{2,}/g, ' ')
+        .trim();
+    if (!cleaned) return out;
+    for (const piece of cleaned.split(/\s*(?:,|\bor\b|\band\b|\/|\|)\s*/i)) {
+        const t = piece.trim().toLowerCase().replace(/[^a-z0-9&+.\s-]/g, '').replace(/\s{2,}/g, ' ').trim();
+        if (t && t.length >= 3 && !NOTE_STOPWORDS.has(t)) out.push(t);
+    }
+    return out;
+}
+// Pull exclusion phrases out of the raw free-text operator notes.
+const NOTE_EXCL_RE = /\b(?:do\s*not|don'?t|never|avoid|exclude|skip|reject|drop|filter\s*out)\b/i;
+const NOTE_VERB_STRIP_RE = /^.*?\b(?:do\s*not|don'?t|never|avoid|exclude|skip|reject|drop|filter\s*out)\b\s*(?:scrap(?:e|ed|ing)?|apply\s*to|apply|target|include|consider|push|send|show|pick|add|want|use)?\b\s*/i;
+function extractNotesSkipPhrases(notesText) {
+    const out = [];
+    if (!notesText || typeof notesText !== 'string') return out;
+    for (const line of notesText.split(/[\n.;]+/)) {
+        const s = line.trim();
+        if (!s || !NOTE_EXCL_RE.test(s)) continue;
+        const obj = s.replace(NOTE_VERB_STRIP_RE, '');
+        out.push(...splitNoteObject(obj));
+    }
+    return out;
+}
+// Pull skip phrases out of the summary's "# Hard Disqualifiers" section.
+// Excludes the age bullet (not title-matchable), the geo bullet (handled by
+// vetoGeoRegion), and the whitelist catch-all ("...other than X", inverse
+// semantics) so we never wrongly skip on those.
+function extractSummarySkipPhrases(aiSummary) {
+    const out = [];
+    if (!aiSummary || typeof aiSummary !== 'string') return out;
+    const m = aiSummary.match(/#+\s*Hard Disqualifiers[^\n]*\n([\s\S]*?)(?:\n#+\s|$)/i);
+    if (!m) return out;
+    for (const rawLine of m[1].split('\n')) {
+        const line = rawLine.trim();
+        if (!/^[-*]\s+/.test(line)) continue;
+        const body = line.replace(/^[-*]\s+/, '').trim();
+        const low = body.toLowerCase();
+        if (/\b(?:48\s*hours|posted\s+more\s+than|hours\s+ago|posting\s+age)\b/.test(low)) continue; // age
+        if (/non-?us|unless the posting|us location|country, region|language market/.test(low)) continue; // geo
+        if (/other than/.test(low)) continue; // whitelist catch-all
+        const mm = low.match(/^skip\s+(.+?)\s*\.?$/);
+        if (!mm) continue;
+        out.push(...splitNoteObject(mm[1]));
+    }
+    return out;
+}
+function normCompact(s) {
+    return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+function noteTokenHit(hay, tok) {
+    if (!hay) return false;
+    const esc = tok.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(?:^|[^a-z0-9])${esc}(?:[^a-z0-9]|$)`, 'i').test(hay);
 }
 
 function buildUserPrompt({ profile, jobs, threshold, aiSummary }) {
@@ -1838,6 +2056,7 @@ function buildUserPrompt({ profile, jobs, threshold, aiSummary }) {
         experienceLevel: profile?.experienceLevel || '(not specified)',
         preferredLocations: preferredLocations.length ? preferredLocations : '(not specified)',
         workAuth: profile?.usWorkEligibility || profile?.visaStatus || '(not specified)',
+        homeCountry: [...homeMarkets(profile)].map((x) => (x === 'ca' ? 'Canada' : 'US')).join(' + '),
         excludedCompanies: profile?.excludedCompanies || profile?.removedCompanies || [],
     };
     const hardSignalsBlock = `## Candidate hard signals (AUTHORITATIVE — quote these exact role strings in your reason)\n${JSON.stringify(hardSignals, null, 2)}\n`;
@@ -2264,6 +2483,46 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
         };
     }
 
+    // Generic operator-note exclusions — union of tokens parsed from the raw
+    // per-client notes AND the summary's Hard Disqualifiers. Built once per
+    // judge run. Makes ANY client's "do not scrap X" note enforce
+    // deterministically, not just the role/geo cases wired explicitly.
+    const noteSkipTokens = [...new Set([
+        ...extractNotesSkipPhrases(profile?.aiNotes?.text || ''),
+        ...extractSummarySkipPhrases(aiSummary || ''),
+    ])];
+    // Client's home country market(s) for the geographic veto — US, Canada,
+    // or both. Computed once per run from the profile.
+    const geoMarkets = homeMarkets(profile);
+    function vetoNotes(decision, job) {
+        if (!decision.pick || noteSkipTokens.length === 0) return decision;
+        const title = String(job?.title || '').toLowerCase();
+        const company = String(job?.company || '').toLowerCase();
+        const companyCompact = normCompact(company);
+        for (const tok of noteSkipTokens) {
+            const inTitle = noteTokenHit(title, tok);
+            let inCompany = noteTokenHit(company, tok);
+            // Multi-word brand tokens (e.g. "jp morgan chase") also match the
+            // punctuation/space-stripped company ("JPMorgan Chase & Co.") so
+            // spacing differences don't slip an excluded employer through.
+            if (!inCompany && tok.includes(' ')) {
+                const tc = normCompact(tok);
+                if (tc.length >= 5 && companyCompact.includes(tc)) inCompany = true;
+            }
+            if (inTitle || inCompany) {
+                const onCompany = inCompany && !inTitle;
+                return {
+                    ...decision,
+                    pick: false,
+                    skipKind: onCompany ? 'company-blocked' : 'role-mismatch',
+                    matchedRole: '',
+                    reason: `Skip — ${onCompany ? 'company' : 'title'} matches operator-note exclusion "${tok}"; client asked not to scrap these. (Auto-vetoed; AI scored ${decision.score}.)`,
+                };
+            }
+        }
+        return decision;
+    }
+
     // Batch in chunks of 8 — matches DEFAULTS.autoBatchSize so a single
     // auto-batch trigger maps to ONE OpenAI call (no internal split).
     // 8 jobs × 4500 char JDs ≈ 9k input tokens — still under gpt-4o-mini's
@@ -2345,7 +2604,8 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
             // All are no-ops when nothing matches.
             norm = vetoExcluded(norm, job);
             norm = vetoQualifierMiss(norm, job);
-            norm = vetoGeoRegion(norm, job);
+            norm = vetoGeoRegion(norm, job, geoMarkets);
+            norm = vetoNotes(norm, job);
             decisions.push(norm);
             // Stream each judged job into the side panel so the operator
             // sees reasoning in real time, not just at the end.
@@ -2372,10 +2632,13 @@ async function judgeOnly() {
     const profile = profileRes.profile;
     const aiSummary = typeof profile?.aiSummary === 'string' ? profile.aiSummary : '';
 
-    // Pre-judge: resolve full JD for every captured job so OpenAI scores
-    // against real disqualifiers, not the 200-char matchSummary preview.
-    notifyPopup('phase', { phase: 'resolving-jds', total: jobs.length });
-    await resolvePreJudge(jobs);
+    // First judge runs on JobRight's NATIVE description only — no scraper.
+    // The dashboard backend's second-stage screening (secondJudgeWorker) opens
+    // the real employer site and re-judges the full posting, so we deliberately
+    // skip pre-judge JD enrichment here to keep stage one cheap and scraper-free.
+    // (Kept commented rather than deleted so the old behavior is one edit away.)
+    // notifyPopup('phase', { phase: 'resolving-jds', total: jobs.length });
+    // await resolvePreJudge(jobs);
 
     notifyPopup('phase', { phase: 'judging', total: jobs.length, usingSummary: !!aiSummary });
     const judge = await aiJudge({
@@ -2455,10 +2718,26 @@ async function autoPushOne(job, decision) {
                 });
                 return { outcome: 'blocked', code: 'LINKEDIN_APPLY' };
             }
-            if (JR_FALLBACK_RX.test(String(applyUrl || ''))) applyUrl = detail.applyLink;
+            // Overwrite when the captured URL is a placeholder/redirect:
+            // JR fallback `/jobs/info/<id>` OR any indeed.com URL
+            // (applystart/clk/viewjob) → use the resolved employer URL.
+            if (JR_FALLBACK_RX.test(String(applyUrl || '')) || /(^|\.)indeed\.com/i.test(String(applyUrl || ''))) {
+                applyUrl = detail.applyLink;
+            }
         }
     } else {
         console.warn('[FF-JRD] auto: detail resolve failed', job.jobId, detail.error || detail.message);
+    }
+    // Policy: never push an Indeed URL to the dashboard. If the employer link
+    // couldn't be resolved (login wall / Easy Apply), the only link we have is
+    // indeed.com — block the job rather than ship a useless redirect URL.
+    if (isIndeedHost(applyUrl) || /(^|\.)indeed\.com/i.test(String(applyUrl || ''))) {
+        state.auto.stats.blocked += 1;
+        notifyPopup('push-result', {
+            jobId: job.jobId, outcome: 'blocked',
+            detail: 'Indeed-only apply URL (employer link not resolved) — skipped',
+        });
+        return { outcome: 'blocked', code: 'INDEED_URL' };
     }
     if (String(applyUrl || '').startsWith('__LINKEDIN_BLOCKED__:')) {
         state.auto.stats.blocked += 1;
@@ -2467,6 +2746,17 @@ async function autoPushOne(job, decision) {
             detail: 'LinkedIn apply URL — skipped per policy',
         });
         return { outcome: 'blocked', code: 'LINKEDIN_APPLY' };
+    }
+    // Policy: never add a job with no real job description. Indeed sometimes
+    // fails to return the JD — adding a JD-less card is useless to the client,
+    // so skip it (operator sees "no JD" on the card + a blocked outcome).
+    if (jobSource(job) === 'indeed' && String(description || '').trim().length < AUTO_MIN_JD_LEN) {
+        state.auto.stats.blocked += 1;
+        notifyPopup('push-result', {
+            jobId: job.jobId, outcome: 'blocked',
+            detail: 'No job description scraped — not added',
+        });
+        return { outcome: 'blocked', code: 'NO_JD' };
     }
     notifyPopup('push-start', { jobId: job.jobId, title: job.title, company: job.company });
     const r = await pushJob({
@@ -2528,11 +2818,12 @@ async function runAutoBatch(batch) {
         console.log('[FF-JRD] auto: profile loaded; aiSummary=' + (ctx.aiSummary ? ctx.aiSummary.length + ' chars' : 'none'));
         // Mark before judging so concurrent ingest doesn't re-queue.
         for (const j of batch) state.auto.processed.add(j.jobId);
-        // Pre-judge: resolve full JD so OpenAI sees real disqualifiers
-        // buried in the body, not just the 200-char matchSummary preview.
-        // resolveJobDetail is cached so this is cheap on re-runs.
-        console.log('[FF-JRD] auto: resolving full JDs for batch of', batch.length);
-        await resolvePreJudge(batch);
+        // First judge runs on JobRight's NATIVE description only — no scraper.
+        // Real-site verification happens in the dashboard backend's second-stage
+        // screening, so we skip pre-judge JD enrichment here. (Kept commented so
+        // the old behavior is one edit away.)
+        // console.log('[FF-JRD] auto: resolving full JDs for batch of', batch.length);
+        // await resolvePreJudge(batch);
         console.log('[FF-JRD] auto: judging', batch.length, 'jobs via OpenAI…');
         const judge = await aiJudge({
             profile: ctx.profile,
@@ -2544,9 +2835,20 @@ async function runAutoBatch(batch) {
             console.warn('[FF-JRD] auto: aiJudge failed', judge.error, judge.message);
             // Un-mark so a later retry can pick them up.
             for (const j of batch) state.auto.processed.delete(j.jobId);
+            state.auto.judgeFailStreak = (state.auto.judgeFailStreak || 0) + 1;
+            if (state.auto.judgeFailStreak >= AUTO_JUDGE_MAX_FAILS) {
+                state.auto.halted = true;
+                state.auto.haltedReason = judge.error || 'JUDGE_FAILED';
+                console.warn('[FF-JRD] auto: HALTED after', state.auto.judgeFailStreak, 'judge failures —', state.auto.haltedReason);
+                notifyPopup('auto-halted', { error: judge.error, message: judge.message, fails: state.auto.judgeFailStreak });
+            }
             notifyPopup('auto-batch-end', { error: judge.error });
             return;
         }
+        // Judge succeeded — clear the failure breaker.
+        state.auto.judgeFailStreak = 0;
+        state.auto.halted = false;
+        state.auto.haltedReason = '';
         state.auto.stats.judged += batch.length;
         const decisionById = new Map(judge.decisions.map((d) => [d.id, d]));
         const picks = batch.filter((j) => decisionById.get(j.jobId)?.pick === true);
@@ -2598,14 +2900,24 @@ async function runAutoBatch(batch) {
         state.auto.running = false;
         try { resolveRunning && resolveRunning(); } catch {}
         state.auto.runningPromise = null;
-        // Maybe more captures arrived while we ran — drain.
-        if (state.config.autoMode) setTimeout(() => tryAutoBatch(), 0);
+        // Maybe more captures arrived while we ran — drain. But never re-arm
+        // when halted (would resume the hammer loop), and back off after a
+        // failure instead of retrying at 0ms.
+        if (state.config.autoMode && !state.auto.halted) {
+            const streak = state.auto.judgeFailStreak || 0;
+            const delay = streak > 0 ? Math.min(30000, 1500 * 2 ** (streak - 1)) : 0;
+            setTimeout(() => tryAutoBatch(), delay);
+        }
     }
 }
 
 function tryAutoBatch() {
     if (state.auto.capHit) {
         console.warn('[FF-JRD] auto: skip — capHit (client target reached)');
+        return;
+    }
+    if (state.auto.halted) {
+        console.warn('[FF-JRD] auto: skip — halted:', state.auto.haltedReason);
         return;
     }
     if (state.auto.running) {
@@ -2644,6 +2956,11 @@ async function flushAutoBatch() {
     if (state.auto.capHit) return;
     if (!state.config.autoMode) return;
     if (!state.config.authEmail || !state.config.openaiKey) return;
+    // Operator-initiated — give the judge a fresh chance even if the auto
+    // pipeline previously halted on repeated failures.
+    state.auto.halted = false;
+    state.auto.haltedReason = '';
+    state.auto.judgeFailStreak = 0;
 
     // 1. If a batch is already running, wait for it to finish before deciding
     //    if more pending exists. Without this the flush returns immediately
@@ -2674,6 +2991,9 @@ async function flushAutoBatch() {
         }
         if (pending.length === 0) return;
         await runAutoBatch(pending);
+        // Judge failed enough to trip the breaker — stop looping (would just
+        // re-hit the same failure). Operator gets the auto-halted message.
+        if (state.auto.halted) return;
         // After runAutoBatch, runningPromise is cleared; if more captures
         // arrived during the run, the next iteration picks them up.
     }
@@ -3140,6 +3460,10 @@ function dispatchMessage(msg, _sender, sendResponse) {
         state.auto.profile = null;
         state.auto.aiSummary = '';
         state.auto.stats = { judged: 0, picks: 0, pushed: 0, dupes: 0, blocked: 0, errors: 0 };
+        // Clear the judge-failure breaker for the new session.
+        state.auto.judgeFailStreak = 0;
+        state.auto.halted = false;
+        state.auto.haltedReason = '';
         // capHit is NOT reset here — it tracks server-side state, not session.
         // Operator must raise the cap on the dashboard to clear it (refreshCapInfo
         // re-runs on push success / panel reopen).
@@ -3194,6 +3518,9 @@ function dispatchMessage(msg, _sender, sendResponse) {
         state.auto.profile = null;
         state.auto.aiSummary = '';
         state.auto.stats = { judged: 0, picks: 0, pushed: 0, dupes: 0, blocked: 0, errors: 0, skipsByKind: {} };
+        state.auto.judgeFailStreak = 0;
+        state.auto.halted = false;
+        state.auto.haltedReason = '';
         setBadge(0);
         chrome.storage.session.remove(Object.values(PERSIST_KEYS)).catch(() => {});
         sendResponse({ ok: true });

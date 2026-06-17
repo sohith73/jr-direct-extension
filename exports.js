@@ -11,8 +11,8 @@ const PROD = {
 // --- Local dev -----------------------------------------------------------
 const LOCAL = {
     API_BASE_URL: 'http://localhost:8086',
-    SCRAPER_BASE_URL: 'http://localhost:8092',
-    CLIENTS_TRACKING_BASE_URL: 'http://localhost:5173',
+    SCRAPER_BASE_URL: 'http://34.100.143.80:8092',
+    CLIENTS_TRACKING_BASE_URL: 'http://localhost:5001',
 };
 
 const PICK = USE_LOCAL ? LOCAL : PROD;
@@ -38,6 +38,7 @@ export const SCRAPER_ENDPOINTS = {
 };
 
 // Fully-qualified URLs — usually pulled from these instead of joining at
+
 // the call site.
 export const API_URLS = {
     CLIENT_LOGIN: `${API_BASE_URL}${API_ENDPOINTS.CLIENT_LOGIN}`,

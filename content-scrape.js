@@ -27,6 +27,10 @@
     // Cache of jobIds we've already reported THIS session — content script
     // is the second line of dedup (background does the auth one).
     const seen = new Set();
+    // jobIds already re-emitted with a non-empty JobRight description, so a
+    // late-arriving JD (API response landed after the card was first sent) is
+    // pushed to background exactly once.
+    const descSent = new Set();
 
     // Map<jobId, {applyLink, originalUrl}> — populated by the MAIN-world
     // injector that intercepts /swan/recommend/list/jobs. Used to:
@@ -53,7 +57,14 @@
         for (const j of jobs) {
             if (!j?.jobId) continue;
             const had = apiApplyLinks.has(j.jobId);
-            apiApplyLinks.set(j.jobId, { applyLink: j.applyLink || '', originalUrl: j.originalUrl || '' });
+            // Merge — a later /swan/ side-call may carry only the URL or only
+            // the JD; never clobber a value we already have with a blank.
+            const prev = apiApplyLinks.get(j.jobId) || {};
+            apiApplyLinks.set(j.jobId, {
+                applyLink: j.applyLink || prev.applyLink || '',
+                originalUrl: j.originalUrl || prev.originalUrl || '',
+                description: j.description || prev.description || '',
+            });
             if (isLinkedInUrl(j.applyLink) || isLinkedInUrl(j.originalUrl)) {
                 if (!linkedInSkipped.has(j.jobId)) {
                     linkedInSkipped.add(j.jobId);
@@ -231,6 +242,10 @@
             fitFlag: pickFitFlag(cardEl),
             tags: pickTags(cardEl),
             applyUrl,
+            // JobRight's OWN composed JD, pulled from the intercepted /swan API
+            // response (content-inject). The first-stage judge scores on this —
+            // no employer-site scrape, so capture never hangs on a slow site.
+            description: apiInfo?.description || '',
             jrLink: link ? `${JR_BASE}${link.getAttribute('href')}` : `${JR_BASE}/jobs/info/${jobId}`,
             capturedAt: new Date().toISOString(),
         };
@@ -246,10 +261,13 @@
             if (!job) continue;
             const jrUrl = `${JR_BASE}/jobs/info/${job.jobId}`;
             const hasRealUrl = job.applyUrl && job.applyUrl !== jrUrl;
+            const hasNewDesc = !!job.description && !descSent.has(job.jobId);
+            if (job.description) descSent.add(job.jobId);
             if (seen.has(job.jobId)) {
-                // Already sent. If we now have a real employer URL (API
-                // enriched after first emit), tell background to overwrite.
-                if (hasRealUrl) updated.push(job);
+                // Already sent. Re-emit so background overwrites when the API
+                // enriched the card after first emit with either the real
+                // employer URL or JobRight's own JD.
+                if (hasRealUrl || hasNewDesc) updated.push(job);
                 continue;
             }
             seen.add(job.jobId);

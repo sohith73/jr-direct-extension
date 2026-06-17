@@ -75,22 +75,144 @@
         return u.pathname + u.search;
     }
 
-    async function fetchJobDetail(jobId) {
+    const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // Cloudflare interstitial / Indeed bot wall — the fetched HTML carries no
+    // JD, just a "Just a moment…" challenge. Detect so we retry instead of
+    // shipping an empty description (the "No job description" bug).
+    function isChallengeHtml(html) {
+        return /just a moment|challenge-platform|cf-browser-verification|_cf_chl_opt/i.test(html);
+    }
+
+    // Indeed's detail pane is styled-components: it injects inline <style>
+    // blocks whose CSS gets swallowed by .textContent, producing a wall of
+    // "--ifl-colors-…" noise. Strip style/script/svg before reading text, and
+    // trim to the real JD so the judge gets plain text only.
+    function normalizeJd(text) {
+        let t = String(text || '');
+        // The pane is prefixed with Job details / Pay / Location chrome; the
+        // real description starts at "Full job description".
+        const idx = t.toLowerCase().lastIndexOf('full job description');
+        if (idx !== -1) t = t.slice(idx + 'full job description'.length);
+        return t.replace(/ /g, ' ').replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+    }
+    function cleanFromNode(node) {
+        if (!node) return '';
+        const clone = node.cloneNode(true);
+        clone.querySelectorAll('style, script, noscript, svg, link, template').forEach((n) => n.remove());
+        return normalizeJd(clone.textContent || '');
+    }
+    function stripHtml(html) {
+        // Add line breaks for block elements so list-heavy JDs stay readable
+        // once flattened to text.
+        const withBreaks = String(html || '')
+            .replace(/<\/(li|p|div|h[1-6]|tr)>/gi, '\n')
+            .replace(/<br\s*\/?>/gi, '\n');
+        const tmp = document.createElement('div');
+        tmp.innerHTML = withBreaks;
+        return cleanFromNode(tmp);
+    }
+
+    // Indeed embeds the JD under several keys depending on render path. Scan
+    // the raw HTML for whichever one is present (value is an escaped JSON
+    // string of HTML).
+    const JD_JSON_KEYS = ['sanitizedJobDescription', 'jobDescriptionText', 'jobDescription'];
+    function jdFromJson(rawHtml) {
+        for (const key of JD_JSON_KEYS) {
+            const re = new RegExp(`"${key}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`);
+            const m = rawHtml.match(re);
+            if (m) {
+                try {
+                    const s = stripHtml(JSON.parse(`"${m[1]}"`));
+                    if (s.length >= JD_MIN_LEN) return s;
+                } catch { /* malformed escape — try next key */ }
+            }
+        }
+        return '';
+    }
+
+    // The live SERP already renders the *selected* job's full JD into the page
+    // DOM. When we're enriching the job that's currently on screen, read it
+    // straight from the live DOM — most reliable, no fetch/parse needed.
+    function liveDomJd(jobId) {
+        try {
+            const cur = new URL(window.location.href).searchParams.get('vjk');
+            if (cur && cur === jobId) {
+                const el = document.querySelector('#jobDescriptionText, [data-testid="jobsearch-JobComponent-description"]');
+                if (el) return cleanFromNode(el);
+            }
+        } catch { /* ignore */ }
+        return '';
+    }
+
+    // JD lives in the SSR DOM (#jobDescriptionText) AND in the embedded job
+    // JSON. The DOM node is sometimes empty (layout A/B, partial hydration) —
+    // the JSON usually carries the full HTML body. Try DOM, then JSON, then
+    // the live page DOM for the on-screen job.
+    function extractDescription(doc, rawHtml, jobId) {
+        const jdEl = doc.querySelector('#jobDescriptionText, [data-testid="jobsearch-JobComponent-description"], .jobsearch-JobComponent-description, #jobDescriptionTextWrapper');
+        let description = cleanFromNode(jdEl);
+        if (description.length >= JD_MIN_LEN) return description;
+        const fromJson = jdFromJson(rawHtml);
+        if (fromJson.length > description.length) description = fromJson;
+        if (description.length < JD_MIN_LEN) {
+            const live = liveDomJd(jobId);
+            if (live.length > description.length) description = live;
+        }
+        return description;
+    }
+
+    // Indeed's dedicated JD endpoint. Returns { "<jk>": "<html JD>" } — clean,
+    // tiny (~2KB vs the 1.2MB SERP), and reliable across sessions/AB-buckets
+    // (the SERP only SSRs #jobDescriptionText for SOME buckets, which is why
+    // JD came back empty for the operator). This is the primary JD source.
+    async function fetchJdViaRpc(jobId, attempt = 0) {
+        try {
+            const res = await fetch(`${window.location.origin}/rpc/jobdescs?jks=${encodeURIComponent(jobId)}`, {
+                credentials: 'include',
+                headers: { accept: 'application/json' },
+            });
+            if (!res.ok) throw new Error('HTTP_' + res.status);
+            const json = JSON.parse(await res.text());
+            const html = json && json[jobId];
+            return html ? stripHtml(html) : '';
+        } catch (e) {
+            if (attempt < 2) { await delay(500 * (attempt + 1)); return fetchJdViaRpc(jobId, attempt + 1); }
+            return '';
+        }
+    }
+
+    async function fetchJobDetail(jobId, attempt = 0) {
         let res;
         try {
             res = await fetch(jdUrl(jobId), { credentials: 'include' });
         } catch (e) {
+            if (attempt < 2) { await delay(600 * (attempt + 1)); return fetchJobDetail(jobId, attempt + 1); }
             return { ok: false, error: 'NETWORK', message: e.message };
         }
-        if (!res.ok) return { ok: false, error: `HTTP_${res.status}` };
+        if (!res.ok) {
+            if (attempt < 2) { await delay(600 * (attempt + 1)); return fetchJobDetail(jobId, attempt + 1); }
+            return { ok: false, error: `HTTP_${res.status}` };
+        }
+        const rawHtml = await res.text();
+        if (isChallengeHtml(rawHtml) && attempt < 2) {
+            await delay(800 * (attempt + 1));
+            return fetchJobDetail(jobId, attempt + 1);
+        }
         let doc;
         try {
-            doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+            doc = new DOMParser().parseFromString(rawHtml, 'text/html');
         } catch (e) {
             return { ok: false, error: 'PARSE', message: e.message };
         }
-        const jdEl = doc.querySelector('#jobDescriptionText, [data-testid="jobsearch-JobComponent-description"]');
-        const description = jdEl ? (jdEl.textContent || '').replace(/\n{3,}/g, '\n\n').trim() : '';
+        // JD: prefer the dedicated rpc/jobdescs endpoint (reliable + clean);
+        // fall back to whatever the SERP SSR carried. Take the longer of the two.
+        const serpDesc = extractDescription(doc, rawHtml, jobId);
+        const rpcDesc = await fetchJdViaRpc(jobId);
+        const description = rpcDesc.length >= serpDesc.length ? rpcDesc : serpDesc;
+        if (description.length < JD_MIN_LEN) {
+            console.warn('[FF-IND] JD empty', jobId, 'serp', serpDesc.length, 'rpc', rpcDesc.length);
+        }
         const salary = txt(doc.querySelector('#salaryInfoAndJobType'));
         const detailTitle = txt(doc.querySelector('h2[data-testid="simpler-jobTitle"], h2.jobsearch-JobInfoHeader-title'));
         const detailCompany = txt(doc.querySelector('[data-company-name="true"], [data-testid="inlineHeader-companyName"]'));

@@ -58,10 +58,7 @@ const els = {
 
     // actions
     start: $('start'),
-    judgeNow: $('judge-now'),
     judge: $('judge'),
-    push: $('push'),
-    pushCount: $('push-count'),
     reset: $('reset'),
 
     // stats
@@ -672,60 +669,31 @@ function applyState() {
     } else {
         els.start.title = '';
     }
-    // In auto-mode the Judge button becomes a "flush remaining" trigger;
-    // it stays enabled whenever capture is active (no isJudged gate).
+    // The single Judge button: stops capture, then judges → resolves → pushes
+    // everything captured. Stays enabled whenever there's something to judge.
     if (cfg.autoMode !== false) {
         if (isProcessing) {
-            els.judge.textContent = 'Pushing…';
-            els.judge.title = 'Pipeline draining — judge → resolve → push.';
+            els.judge.textContent = 'Judging…';
+            els.judge.title = 'Pipeline running — judge → resolve → push.';
             els.judge.disabled = true;
         } else {
-            // Stop & push stays clickable even during auto-batch — flushAutoBatch
-            // queues behind the in-flight promise and drains the rest. UI label
-            // hints at the queueing.
-            const stopLabel = autoRunning
-                ? `Stop & push (queue · ${captureCount})`
-                : (captureCount > 0 ? `Stop scraping & push (${captureCount})` : 'Stop scraping & push');
-            els.judge.textContent = stopLabel;
+            els.judge.textContent = captureCount > 0 ? `Judge (${captureCount})` : 'Judge';
             els.judge.title = autoRunning
-                ? 'Auto-batch in flight. Click to queue Stop & Push for after it finishes.'
-                : 'Stops capture, drains pending through judge → resolve → push.';
+                ? 'Auto-batch in flight. Click to queue judge + push for after it finishes.'
+                : 'Stops capture, then judges + resolves + pushes all captured jobs.';
             els.judge.disabled = captureCount === 0;
         }
-        // Judge now button — drains current pending without stopping capture.
-        // Stays clickable during autoRunning (queues for after) so operator
-        // never feels locked out. Disabled only during the single-shot
-        // manual flush (isProcessing) or when there's nothing to judge.
-        if (els.judgeNow) {
-            if (isProcessing) {
-                els.judgeNow.textContent = 'Working…';
-                els.judgeNow.disabled = true;
-            } else if (autoRunning) {
-                els.judgeNow.textContent = captureCount > 0
-                    ? `Judge now (queue · ${captureCount})`
-                    : 'Judging…';
-                els.judgeNow.title = 'Auto-batch in flight. Click to queue another drain after it finishes.';
-                els.judgeNow.disabled = captureCount === 0;
-            } else {
-                els.judgeNow.textContent = captureCount > 0
-                    ? `Judge now (${captureCount})`
-                    : 'Judge now';
-                els.judgeNow.title = 'Process pending captures right now without stopping capture.';
-                els.judgeNow.disabled = captureCount === 0 || capHit;
-            }
-        }
     } else {
-        els.judge.textContent = 'Judge captured';
+        els.judge.textContent = 'Judge';
         els.judge.title = '';
         els.judge.disabled = !captureActive || captureCount === 0 || isProcessing || isJudged;
-        if (els.judgeNow) els.judgeNow.hidden = true;
     }
-    if (cfg.autoMode !== false && els.judgeNow) els.judgeNow.hidden = false;
-    els.push.hidden = !isJudged || cfg.autoMode !== false;
+    if (els.push) els.push.hidden = !isJudged || cfg.autoMode !== false;
     if (isJudged) updatePushButton();
 }
 
 function updatePushButton() {
+    if (!els.push) return; // push button removed — auto-mode handles pushing
     const selectedCount = countSelectedPicks();
     els.pushCount.textContent = String(selectedCount);
     if (isResolving) {
@@ -845,6 +813,14 @@ function renderCard(entry) {
             actionsHtml += `<a href="${escapeHtml(rawUrl)}" target="_blank" rel="noreferrer" title="${escapeHtml(rawUrl)}">View ↗</a>`;
         }
     }
+    // Job description — let the operator expand and verify the scraped JD
+    // right in the panel (or see clearly when nothing was captured).
+    const jd = String(job.description || '').trim();
+    if (jd) {
+        actionsHtml += `<button class="jd-toggle" data-jd-jobid="${escapeHtml(decision.id)}" title="Show the scraped job description">JD ↓</button>`;
+    } else {
+        actionsHtml += `<span class="jd-missing" title="No job description was scraped for this job">no JD</span>`;
+    }
     let outcomeHtml = '';
     if (pushing) {
         outcomeHtml = `<span class="outcome-chip pushing">pushing…</span>`;
@@ -871,6 +847,7 @@ function renderCard(entry) {
         ${decision.skipKind ? `<div class="skip-kind-tag skip-kind-tag-${escapeHtml(decision.skipKind)}">${escapeHtml(skipKindLabel(decision.skipKind))}</div>` : ''}
         ${decision.reason ? `<div class="decision-reason">${escapeHtml(decision.reason)}</div>` : ''}
         ${actionsHtml || outcomeHtml ? `<div class="decision-actions">${actionsHtml}${outcomeHtml}</div>` : ''}
+        ${jd ? `<div class="jd-panel" data-jd-panel="${escapeHtml(decision.id)}" hidden><div class="jd-panel-meta">${jd.split(/\s+/).length} words</div><pre class="jd-panel-body">${escapeHtml(jd)}</pre></div>` : ''}
     `;
     return card;
 }
@@ -1227,34 +1204,6 @@ async function startCapture() {
     } else { setMessage('Failed to start capture.', 'error'); }
 }
 
-// runJudgeNow: process anything captured-but-unprocessed RIGHT NOW without
-// halting capture. Use when auto-batch hasn't fired yet (pending count
-// stuck below batch threshold) or when the SW's auto.running flag wedged.
-// Capture stays active so operator can keep scrolling.
-async function runJudgeNow() {
-    if (cfg.autoMode === false) return; // manual mode uses old runJudge path
-    setProcessing(true, '<span class="step">Judge now</span> — processing remaining captures…');
-    setMessage('Judging unprocessed captures… capture stays active.');
-    setLive('Judging', `Processing pending jobs (capture continues)…`);
-    applyState();
-    const r = await send('jrd-flush-auto');
-    setProcessing(false);
-    if (!r?.ok) {
-        setMessage(`Judge now failed: ${r?.error || 'UNEXPECTED'} ${r?.message || ''}`, 'error');
-        applyState();
-        return;
-    }
-    const s = r.stats || {};
-    setMessage(
-        `✓ Processed — judged ${s.judged || 0} · picks ${s.picks || 0} · pushed ${s.pushed || 0} · dupes ${s.dupes || 0} · blocked ${s.blocked || 0} · errors ${s.errors || 0}. Capture still active.`,
-        'ok',
-    );
-    pushTickerLine(`✓ judge-now — pushed ${s.pushed || 0} / picks ${s.picks || 0}`);
-    applyState();
-    // Refresh today tile so SCRAPED / PUSHED reflect the just-processed batch.
-    setTimeout(() => loadDailyStats().catch(() => {}), 600);
-}
-
 async function runJudge() {
     // In auto-mode, the SW pipelines judge → resolve → push as the operator
     // scrolls. Manual click here drains anything not yet auto-batched and
@@ -1331,28 +1280,6 @@ async function runJudge() {
     applyState();
 }
 
-async function runPush() {
-    const selectedIds = [];
-    for (const [jobId, e] of decisionsMap.entries()) if (e.selectedPick) selectedIds.push(jobId);
-    if (selectedIds.length === 0) { setMessage('No picks selected.', 'warn'); return; }
-    setProcessing(true, `<span class="step">Pushing</span> ${selectedIds.length} jobs…`);
-    setMessage(`Pushing ${selectedIds.length} selected jobs…`);
-    applyState();
-    const r = await send('jrd-push-selected', { jobIds: selectedIds });
-    setProcessing(false);
-    applyState();
-    if (!r?.ok) { setMessage(`Push failed: ${r?.error || 'UNEXPECTED'} ${r?.message || ''}`, 'error'); return; }
-    const res = r.result;
-    setMessage(
-        `Done. ${(res.results.pushed || []).length} pushed, ${(res.results.duplicates || []).length} dupes, `
-        + `${(res.results.blocked || []).length} blocked, ${(res.results.errors || []).length} errors.`,
-        'ok',
-    );
-    setProgress(100, '<span class="step">Done</span>');
-    isJudged = false;
-    await refreshState();
-}
-
 async function stopCapture() {
     if (!captureActive) { setMessage('Capture is already stopped.', 'warn'); return; }
     setMessage('Stopping capture — auto-pipeline will drain remaining jobs…');
@@ -1422,6 +1349,27 @@ chrome.runtime.onMessage.addListener((msg) => {
                     setLive('Capturing', `${msg.count} job${msg.count === 1 ? '' : 's'} in buffer · scroll for more`);
                 }
             }
+            break;
+        case 'source-blocked': {
+            const pretty = (s) => s === 'jobright' ? 'JobRight' : s === 'indeed' ? 'Indeed' : (s || 'this site');
+            const allowed = (msg.allowed || ['jobright']).map(pretty).join(' / ');
+            const site = pretty(msg.source);
+            const hint = (msg.allowed || []).includes('jobright')
+                ? `Open jobright.ai/jobs/recommend to scrape, or enable ${site} for this client in Clients-Tracking → AI Summary → Scrape sources.`
+                : `Enable ${site} for this client in Clients-Tracking → AI Summary → Scrape sources.`;
+            setMessage(`⚠ This client supports only ${allowed} — ${site} jobs are skipped. ${hint}`, 'warn');
+            setLive(`${allowed}-only client`, `${site} jobs ignored — nothing captured here.`, 'error');
+            break;
+        }
+        case 'auto-halted':
+            setProcessing(false);
+            setMessage(
+                `⚠ Auto-judging paused after repeated failures (${msg.error || 'JUDGE_FAILED'}). ` +
+                `Check your internet connection and OpenAI key, then click Judge to retry.`,
+                'error',
+            );
+            setLive('Judging paused', `${msg.error || 'judge failed'} — fix, then click Judge.`, 'error');
+            applyState();
             break;
         case 'linkedin-skip':
             linkedinSkippedCount = msg.count;
@@ -1644,9 +1592,7 @@ const shortcutHintBtn = $('shortcut-hint');
 if (shortcutHintBtn) shortcutHintBtn.addEventListener('click', () => toggleShortcutHelp());
 els.saveConfig.addEventListener('click', saveConfig);
 els.start.addEventListener('click', startCapture);
-els.judgeNow.addEventListener('click', runJudgeNow);
 els.judge.addEventListener('click', runJudge);
-els.push.addEventListener('click', runPush);
 els.reset.addEventListener('click', resetCapture);
 
 els.decisionsList.addEventListener('click', (e) => {
@@ -1660,6 +1606,18 @@ els.decisionsList.addEventListener('click', (e) => {
     if (resolveBtn) {
         e.preventDefault();
         resolveOriginalUrl(resolveBtn);
+        return;
+    }
+    const jdBtn = e.target.closest('[data-jd-jobid]');
+    if (jdBtn) {
+        e.preventDefault();
+        const panel = jdBtn.closest('.decision-card')?.querySelector(`[data-jd-panel="${CSS.escape(jdBtn.dataset.jdJobid)}"]`);
+        if (panel) {
+            const open = panel.hidden;
+            panel.hidden = !open;
+            jdBtn.textContent = open ? 'JD ↑' : 'JD ↓';
+            jdBtn.classList.toggle('open', open);
+        }
     }
 });
 
@@ -1704,14 +1662,13 @@ window.addEventListener('beforeunload', (e) => {
 
 // ---- keyboard shortcuts -------------------------------------------------
 //
-// S=start · D=stop · K=judge · P=push · R=reset · ?=help · Esc=close help.
+// S=start · D=stop · K=judge · R=reset · ?=help · Esc=close help.
 // Skip when focus lives in a form control (don't hijack typing) and skip
 // when the panel is on the login or code view (creds/codes need every key).
 const SHORTCUTS = [
     { key: 's', label: 'Start capture',  run: () => safeClick(els.start) },
     { key: 'd', label: 'Stop capture',   run: () => stopCapture() },
-    { key: 'k', label: 'Judge / flush',  run: () => safeClick(els.judge) },
-    { key: 'p', label: 'Push picks',     run: () => safeClick(els.push) },
+    { key: 'k', label: 'Judge',          run: () => safeClick(els.judge) },
     { key: 'r', label: 'Reset session',  run: () => safeClick(els.reset) },
     { key: '?', label: 'Toggle help',    run: () => toggleShortcutHelp() },
 ];
