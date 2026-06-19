@@ -1709,6 +1709,20 @@ Step 1 — Extract the discipline QUALIFIER from each preferredRole.
 The bare role noun ("Analyst", "Engineer", "Manager", "Specialist",
 "Developer") is NEVER a qualifier on its own.
 
+SOFTEN — LEAN INCLUSIVE (important): role fit here is just a FIRST-pass
+filter; a human reviews picks and a second stage re-checks the real posting.
+So when the title is in the SAME role family as a preferred role — i.e. the
+same role noun (Analyst↔Analyst, Engineer↔Engineer, Manager↔Manager,
+Scientist↔Scientist) — and the JD / whyMatch / candidate skills are broadly
+consistent with the profile, PICK it even if the exact qualifier differs.
+Example: candidate wants "Data Analyst" → "Business Analyst", "Reporting
+Analyst", "Operations Analyst" are PICKS (same Analyst family, judged against
+the whole profile). Judge against the WHOLE profile (aiSummary + skills +
+experience), not the title alone. Only SKIP on role when the title is a
+CLEARLY different discipline or role noun (e.g. "Sales Manager" or "Mechanical
+Engineer" for a data/analyst candidate) or it hits excludedRoles. When
+borderline, prefer PICK.
+
 Step 2 — Look at the JOB TITLE. Pick when the title contains EITHER:
   (a) a direct qualifier match from the candidate's list (case-insensitive,
       allow obvious abbreviations: BI ↔ Business Intelligence,
@@ -2466,12 +2480,35 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
         const tokens = seed.split(/\s+/).filter((t) => t.length >= 2);
         for (const tok of tokens) for (const v of expandQualifier(tok)) qualifierTokens.add(v);
     }
+    // Role-noun "family" set — the bare role noun(s) in each preferred role
+    // (Analyst, Engineer, Manager, Scientist, …). Used to SOFTEN the qualifier
+    // veto: a title that shares the same role noun (e.g. preferred "Data
+    // Analyst" → title "Business Analyst", or any "* Engineer") is close enough
+    // to let the AI's pick stand instead of being hard-vetoed on a qualifier
+    // miss. Pure seniority words are excluded so they don't widen the family.
+    const SENIORITY_ONLY = /^(lead|director|vp|senior|sr|jr|junior|staff|intern|principal|chief|head|officer|executive|associate)$/;
+    const preferredRoleNouns = new Set();
+    for (const role of positiveRoles) {
+        const nouns = String(role).toLowerCase().match(ROLE_NOUN_STRIP);
+        if (nouns) {
+            for (const n of nouns) {
+                const t = n.trim();
+                if (t && !SENIORITY_ONLY.test(t)) preferredRoleNouns.add(t);
+            }
+        }
+    }
     function vetoQualifierMiss(decision, job) {
         if (!decision.pick) return decision;
         if (qualifierTokens.size === 0) return decision; // no positive roles → don't veto
         const title = String(job?.title || '').toLowerCase();
         for (const tok of qualifierTokens) {
-            if (tok && title.includes(tok)) return decision; // match found
+            if (tok && title.includes(tok)) return decision; // qualifier match found
+        }
+        // Soften: same role-family (e.g. preferred "Data Analyst" → title
+        // "Business Analyst") — defer to the AI's pick rather than hard-veto.
+        // Truly cross-discipline titles (different role noun) still get vetoed.
+        for (const noun of preferredRoleNouns) {
+            if (noun && title.includes(noun)) return decision;
         }
         const sample = positiveRoles.slice(0, 4).join(', ') + (positiveRoles.length > 4 ? '…' : '');
         return {
