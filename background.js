@@ -2656,16 +2656,12 @@ async function judgeOnly() {
     };
     await persistJudged();
     notifyPopup('phase', { phase: 'judged' });
-    // Fire-and-forget URL + JD resolution — operator can review picks
-    // while SW resolves in parallel. Track the in-flight promise so
-    // Push can await it and never POST partial data.
-    state.resolveInFlight = resolvePicksAsync()
-        .catch((e) => {
-            console.warn('[FF-JRD] resolvePicksAsync threw:', e?.message);
-        })
-        .finally(() => {
-            state.resolveInFlight = null;
-        });
+    // Stage 1 is scraper-free: do NOT run resolvePicksAsync (it called the
+    // Playwright scraper to resolve employer JD/URL for picks). Picks push
+    // directly with JobRight's captured applyUrl + JD; the dashboard's
+    // second-stage screening does the real-site Playwright scrape.
+    // state.resolveInFlight = resolvePicksAsync()...  // disabled
+    state.resolveInFlight = null;
     return {
         ok: true,
         decisions: judge.decisions,
@@ -2704,29 +2700,18 @@ async function autoPushOne(job, decision) {
         });
         return { outcome: 'blocked', code: 'CAP_HIT' };
     }
-    const detail = await resolveJobDetail(job.jobId);
-    let applyUrl = job.applyUrl;
+    // STAGE 1 SCRAPER-FREE: push directly with JobRight's captured applyUrl +
+    // composed JD. No Playwright/scraper round-trip here (that caused the push
+    // lag) — the dashboard's second-stage screening scrapes the real site.
+    let applyUrl = job.applyUrl || job.jrLink || '';
     let description = job.description || job.matchSummary || '';
-    if (detail.ok) {
-        if (detail.description && detail.description.length > description.length) description = detail.description;
-        if (detail.applyLink) {
-            if (isLinkedInUrlBg(detail.applyLink)) {
-                state.auto.stats.blocked += 1;
-                notifyPopup('push-result', {
-                    jobId: job.jobId, outcome: 'blocked',
-                    detail: 'LinkedIn-hosted apply URL — skipped per policy',
-                });
-                return { outcome: 'blocked', code: 'LINKEDIN_APPLY' };
-            }
-            // Overwrite when the captured URL is a placeholder/redirect:
-            // JR fallback `/jobs/info/<id>` OR any indeed.com URL
-            // (applystart/clk/viewjob) → use the resolved employer URL.
-            if (JR_FALLBACK_RX.test(String(applyUrl || '')) || /(^|\.)indeed\.com/i.test(String(applyUrl || ''))) {
-                applyUrl = detail.applyLink;
-            }
-        }
-    } else {
-        console.warn('[FF-JRD] auto: detail resolve failed', job.jobId, detail.error || detail.message);
+    if (isLinkedInUrlBg(applyUrl)) {
+        state.auto.stats.blocked += 1;
+        notifyPopup('push-result', {
+            jobId: job.jobId, outcome: 'blocked',
+            detail: 'LinkedIn apply URL — skipped per policy',
+        });
+        return { outcome: 'blocked', code: 'LINKEDIN_APPLY' };
     }
     // Policy: never push an Indeed URL to the dashboard. If the employer link
     // couldn't be resolved (login wall / Easy Apply), the only link we have is
@@ -3079,9 +3064,9 @@ async function pushSelected({ jobIds }) {
     if (!state.judged) {
         return { ok: false, error: 'NOT_JUDGED', message: 'No judge result in memory or storage. Click Judge again.' };
     }
-    // Block until any in-flight resolve completes — guarantees the
-    // dashboard receives full JD + real applyLink, not the short
-    // matchSummary captured at scroll time.
+    // Stage 1 is scraper-free, so there is normally no in-flight resolve to
+    // wait on (resolvePicksAsync is disabled). Kept as a defensive no-op in
+    // case a legacy resolve was started elsewhere.
     if (state.resolveInFlight) {
         console.log('[FF-JRD] pushSelected: awaiting in-flight resolve…');
         notifyPopup('phase', { phase: 'awaiting-resolve' });
@@ -3105,18 +3090,18 @@ async function pushSelected({ jobIds }) {
         const d = decisionById.get(j.jobId) || {};
         notifyPopup('push-start', { jobId: j.jobId, title: j.title, company: j.company });
 
-        // Picks were pre-resolved right after judge (resolvePicksAsync).
-        // Two states to handle here:
-        //   1. applyUrl prefixed with __LINKEDIN_BLOCKED__ → operator
-        //      policy skip. Mark blocked, don't POST.
-        //   2. applyUrl still JR fallback → resolution failed earlier;
-        //      do one last attempt synchronously.
-        if (String(j.applyUrl || '').startsWith('__LINKEDIN_BLOCKED__:')) {
-            const lk = j.applyUrl.replace('__LINKEDIN_BLOCKED__:', '');
+        // STAGE 1 IS JOBRIGHT-ONLY AND SCRAPER-FREE. Push the pick directly
+        // with the data JobRight already gave us — the employer applyUrl
+        // captured from the JR API and the composed JD (content-inject). Do
+        // NOT call the scraper/Playwright here; that round-trip was the slow
+        // part ("PUSHED 0" lag). The dashboard's second-stage screening opens
+        // the real employer site (Playwright) and re-judges — that is the ONLY
+        // place we scrape.
+        const applyUrl = String(j.applyUrl || j.jrLink || '');
+        if (isLinkedInUrlBg(applyUrl)) {
             notifyPopup('push-result', {
-                jobId: j.jobId,
-                outcome: 'blocked',
-                detail: `LinkedIn apply URL (${lk}) — skipped per policy`,
+                jobId: j.jobId, outcome: 'blocked',
+                detail: 'LinkedIn apply URL — skipped per policy',
             });
             results.blocked.push({
                 jobId: j.jobId, title: j.title, company: j.company,
@@ -3128,58 +3113,13 @@ async function pushSelected({ jobIds }) {
             });
             continue;
         }
-        // ALWAYS resolve at push time. Cache makes already-resolved
-        // jobs return instantly. Guarantees dashboard receives full JD
-        // every time, not the 200-char matchSummary captured at scroll.
-        const detail = await resolveJobDetail(j.jobId);
-        console.log('[FF-JRD] push-prep', j.jobId, {
-            preDescLen: String(j.description || '').length,
-            preApply: j.applyUrl,
-            resolveOk: detail.ok,
-            resolveDescLen: detail.ok ? detail.description.length : 0,
-            resolveApply: detail.ok ? detail.applyLink : null,
-            cached: detail.cached,
-        });
-        if (detail.ok) {
-            if (detail.description && detail.description.length > (j.description || '').length) {
-                j.description = detail.description;
-            }
-            if (detail.applyLink) {
-                if (isLinkedInUrlBg(detail.applyLink)) {
-                    notifyPopup('push-result', {
-                        jobId: j.jobId, outcome: 'blocked',
-                        detail: 'LinkedIn-hosted apply URL — skipped per policy',
-                    });
-                    results.blocked.push({
-                        jobId: j.jobId, title: j.title, company: j.company,
-                        code: 'LINKEDIN_APPLY', message: 'real apply URL is LinkedIn',
-                    });
-                    notifyPopup('push-progress', {
-                        done: results.pushed.length + results.duplicates.length + results.blocked.length + results.errors.length,
-                        target: picks.length,
-                    });
-                    continue;
-                }
-                // Overwrite when the captured URL is a placeholder/redirect:
-                //   • JR fallback `/jobs/info/<id>`
-                //   • any indeed.com URL (applystart/clk/viewjob) → replace
-                //     with the resolved original employer URL.
-                const cur = String(j.applyUrl || '');
-                if (JR_FALLBACK_RX.test(cur) || /(^|\.)indeed\.com/i.test(cur)) {
-                    j.applyUrl = detail.applyLink;
-                    notifyPopup('applyurl-resolved', { jobId: j.jobId, applyUrl: detail.applyLink });
-                }
-            }
-        } else {
-            console.warn('[FF-JRD] push-time resolve failed', j.jobId, detail.error || detail.message);
-        }
 
         const r = await pushJob({
-            // Push the FULL resolved JD (resolveJobDetail composed:
-            // jobSummary + Responsibilities + Must have + Nice to have +
-            // Key skills + Benefits). Falls back to matchSummary only
-            // when resolve never landed for this job. AI score/reason
-            // belongs on the dashboard's metadata, NOT in the JD body.
+            // Push JobRight's composed JD (jobSummary + Responsibilities +
+            // Must/Nice-have + Key skills + Benefits) captured from the JR API
+            // via content-inject; falls back to matchSummary when absent. No
+            // scraper round-trip — the dashboard re-scrapes the real site in
+            // second-stage screening. AI score/reason go on dashboard metadata.
             job: { ...j, description: j.description || j.matchSummary || '' },
             clientEmail: state.config.authEmail,
             clientName: state.config.authName,
