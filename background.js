@@ -3130,7 +3130,14 @@ async function pushSelected({ jobIds }) {
     }
     const idSet = new Set(jobIds);
     const decisionById = new Map((state.judged.decisions || []).map((d) => [d.id, d]));
-    const picks = (state.judged.jobs || []).filter((j) => idSet.has(j.jobId));
+    // Dedupe by jobId (keep the LAST = most-recently-judged entry). A re-judge
+    // (late-JD path) appends the same job to state.judged.jobs again, so without
+    // this the manual Push would POST the job twice.
+    const picks = [...new Map(
+        (state.judged.jobs || [])
+            .filter((j) => idSet.has(j.jobId))
+            .map((j) => [j.jobId, j])
+    ).values()];
     console.log('[FF-JRD] pushSelected picks:', picks.length, 'of', state.judged.jobs?.length || 0);
     if (picks.length === 0) {
         return { ok: false, error: 'NO_PICKS', message: `No matching jobs found in judged set (have ${state.judged.jobs?.length || 0} judged jobs)` };
