@@ -2524,10 +2524,25 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
     // per-client notes AND the summary's Hard Disqualifiers. Built once per
     // judge run. Makes ANY client's "do not scrap X" note enforce
     // deterministically, not just the role/geo cases wired explicitly.
-    const noteSkipTokens = [...new Set([
+    const noteSkipTokensRaw = [...new Set([
         ...extractNotesSkipPhrases(profile?.aiNotes?.text || ''),
         ...extractSummarySkipPhrases(aiSummary || ''),
     ])];
+    // SAFETY: never let a skip-phrase veto a role the client actually WANTS.
+    // A skip phrase that equals / contains / is contained by a positive
+    // preferredRole (e.g. note "do not scrap financial analyst at agencies"
+    // stripped to "financial analyst" while preferredRoles has "Financial
+    // Analyst") would otherwise hard-veto a perfect match. Drop those — keep
+    // only genuine exclusions (companies, off-target roles).
+    const positiveRolesLower = new Set(positiveRoles.map((r) => String(r).toLowerCase().trim()).filter(Boolean));
+    const noteSkipTokens = noteSkipTokensRaw.filter((tok) => {
+        const t = String(tok).toLowerCase().trim();
+        if (!t) return false;
+        for (const p of positiveRolesLower) {
+            if (t === p || t.includes(p) || p.includes(t)) return false; // overlaps a wanted role → don't veto
+        }
+        return true;
+    });
     // Client's home country market(s) for the geographic veto — US, Canada,
     // or both. Computed once per run from the profile.
     const geoMarkets = homeMarkets(profile);
@@ -3316,16 +3331,29 @@ function dispatchMessage(msg, _sender, sendResponse) {
 
     if (msg.type === 'jrd-update-jobs') {
         // Overwrite already-captured entries with their late-arriving real
-        // employer URL (replaces JR fallback `/jobs/info/<id>`).
+        // employer URL and/or JobRight JD (the /swan API row can land after the
+        // card was first emitted).
         let touched = 0;
+        let reJudge = false;
         for (const j of msg.jobs || []) {
             if (!j?.jobId) continue;
             if (state.capture.jobs.has(j.jobId)) {
+                const prev = state.capture.jobs.get(j.jobId);
                 state.capture.jobs.set(j.jobId, j);
                 touched += 1;
+                // If the JD grew AND this job was already auto-judged (likely on
+                // an empty/preview description) but not yet pushed, clear it from
+                // the processed set so the auto pipeline re-judges it on the real
+                // JobRight description. Duplicate pushes are deduped server-side.
+                const grew = String(j.description || '').length > String(prev?.description || '').length;
+                if (grew && state.auto?.processed?.has(j.jobId)) {
+                    state.auto.processed.delete(j.jobId);
+                    reJudge = true;
+                }
             }
         }
         if (touched > 0) persistCapture();
+        if (reJudge && state.config.autoMode) tryAutoBatch();
         return false;
     }
 
