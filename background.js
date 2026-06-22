@@ -2736,16 +2736,21 @@ async function judgeOnly() {
 // JD via scraper backend (Playwright) → pushes picks straight to dashboard.
 // Manual Judge / Push buttons stay available as a fallback.
 
+const AUTO_PROFILE_TTL_MS = 5 * 60 * 1000; // re-pull summary/profile every 5 min — picks up edits without re-login
 async function ensureAutoProfile() {
-    if (state.auto.profile) {
-        return { ok: true, profile: state.auto.profile, aiSummary: state.auto.aiSummary };
-    }
+    const fresh = state.auto.profile && (Date.now() - (state.auto.profileFetchedAt || 0) < AUTO_PROFILE_TTL_MS);
+    if (fresh) return { ok: true, profile: state.auto.profile, aiSummary: state.auto.aiSummary };
     if (!state.config.authEmail) return { ok: false, error: 'NO_CLIENT' };
     if (!state.config.openaiKey) return { ok: false, error: 'NO_OPENAI_KEY' };
     const profileRes = await getProfile(state.config.authEmail);
-    if (!profileRes.ok) return { ok: false, error: 'PROFILE_LOAD', message: profileRes.error };
+    if (!profileRes.ok) {
+        // Transient fetch failure: keep using the cached copy if we have one.
+        if (state.auto.profile) return { ok: true, profile: state.auto.profile, aiSummary: state.auto.aiSummary };
+        return { ok: false, error: 'PROFILE_LOAD', message: profileRes.error };
+    }
     state.auto.profile = profileRes.profile;
     state.auto.aiSummary = typeof profileRes.profile?.aiSummary === 'string' ? profileRes.profile.aiSummary : '';
+    state.auto.profileFetchedAt = Date.now();
     return { ok: true, profile: state.auto.profile, aiSummary: state.auto.aiSummary };
 }
 
