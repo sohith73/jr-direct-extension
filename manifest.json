@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "FlashFire JR + Indeed → Dashboard Direct",
-  "version": "1.29.0",
+  "version": "1.29.0.2.2",
   "description": "Scrape jobright.ai AND Indeed job listings from the DOM as you scroll, AI-judge in-extension against the client summary, and push picks straight to the FlashFire dashboard.",
   "permissions": ["storage", "activeTab", "tabs", "scripting"],
   "host_permissions": [
