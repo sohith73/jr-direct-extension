@@ -2621,6 +2621,14 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
             return { ok: false, error: `OPENAI_${res.status}`, message: txt.slice(0, 400) };
         }
         const data = await res.json();
+        // Real OpenAI usage → milestone cost (free from the response). ponytail:
+        // OpenAI-direct judge, so all batches are OpenAI; ||= avoids touching
+        // the two stats-init sites.
+        const _u = data?.usage || {};
+        const _ms = (state.auto.stats.modelStats ||= { openaiBatches: 0, inputTokens: 0, outputTokens: 0 });
+        _ms.openaiBatches += 1;
+        _ms.inputTokens += Number(_u.prompt_tokens) || 0;
+        _ms.outputTokens += Number(_u.completion_tokens) || 0;
         const content = data?.choices?.[0]?.message?.content || '{}';
         let parsed = null;
         try { parsed = JSON.parse(content); } catch { /* ignore */ }
@@ -3092,6 +3100,7 @@ async function reportSessionStat(reason = 'stop') {
             errors: stats.errors || 0,
             skipsByKind: skips,
             skipsRollup: { ...skipsRollup, other: Math.max(0, skipsOther) },
+            modelStats: stats.modelStats || {},
             startedAt,
             endedAt: new Date().toISOString(),
             extensionVersion: chrome?.runtime?.getManifest?.()?.version || '',
