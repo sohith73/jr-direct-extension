@@ -2625,10 +2625,11 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
         // OpenAI-direct judge, so all batches are OpenAI; ||= avoids touching
         // the two stats-init sites.
         const _u = data?.usage || {};
-        const _ms = (state.auto.stats.modelStats ||= { openaiBatches: 0, inputTokens: 0, outputTokens: 0 });
+        const _ms = (state.auto.stats.modelStats ||= { openaiBatches: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0 });
         _ms.openaiBatches += 1;
         _ms.inputTokens += Number(_u.prompt_tokens) || 0;
         _ms.outputTokens += Number(_u.completion_tokens) || 0;
+        _ms.cachedTokens += Number(_u.prompt_tokens_details?.cached_tokens) || 0; // billed at 50%
         const content = data?.choices?.[0]?.message?.content || '{}';
         let parsed = null;
         try { parsed = JSON.parse(content); } catch { /* ignore */ }
