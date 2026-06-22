@@ -1657,8 +1657,11 @@ For each job, decide whether it matches the candidate's profile.
 The user prompt contains a "## Candidate hard signals" block with the
 authoritative preferredRoles, excludedRoles, experienceLevel, and
 preferredLocations pulled DIRECTLY from the client's onboarding profile.
-This is the ground truth — the candidate-brief / aiSummary may paraphrase,
-but if they conflict, the hard-signals block wins.
+This is the ground truth for ROLE-NAME STRINGS — the candidate-brief / aiSummary
+may paraphrase role names, so cite the exact hard-signals strings there.
+BUT operator directives in the brief — any "— operator priority" / "— operator
+allows" bullet and every "# Hard Disqualifiers" line — are the HIGHEST authority
+and OVERRIDE profile/resume signals on any real conflict. Honour them first.
 
 excludedRoles is a HARD VETO list. The candidate explicitly opted out
 of these role families (e.g. "Technician", "QA", "Manager"). If the job
