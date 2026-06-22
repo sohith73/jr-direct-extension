@@ -2546,6 +2546,18 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
     // Client's home country market(s) for the geographic veto — US, Canada,
     // or both. Computed once per run from the profile.
     const geoMarkets = homeMarkets(profile);
+    // Hard intern/co-op veto. If the summary or notes say to skip internships/
+    // co-op (any phrasing), DETERMINISTICALLY skip every intern/co-op title —
+    // robust to "internships" (notes) vs "Intern" (title) token mismatches.
+    const rejectsIntern = /\bskip\b[^.\n]*\b(interns?|internships?|co[\s-]?ops?)\b/i.test(aiSummary || '')
+        || /\b(?:do\s*not|don'?t|never)\b[^.\n]*\bscrap\b[^.\n]*\b(interns?|internships?|co[\s-]?ops?)\b/i.test(profile?.aiNotes?.text || '');
+    const INTERN_TITLE_RX = /\b(intern|interns|internship|internships|co-?op|co\s?op|coop)\b/i;
+    function vetoIntern(decision, job) {
+        if (!decision.pick || !rejectsIntern) return decision;
+        if (!INTERN_TITLE_RX.test(String(job?.title || ''))) return decision;
+        return { ...decision, pick: false, skipKind: 'role-mismatch', matchedRole: '',
+            reason: `Skip — "${job?.title || ''}" is an internship/co-op; client excludes these. (Auto-vetoed; AI scored ${decision.score}.)` };
+    }
     function vetoNotes(decision, job) {
         if (!decision.pick || noteSkipTokens.length === 0) return decision;
         const title = String(job?.title || '').toLowerCase();
@@ -2664,6 +2676,7 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
             //      language market and no US location is confirmed.
             // All are no-ops when nothing matches.
             norm = vetoExcluded(norm, job);
+            norm = vetoIntern(norm, job);
             norm = vetoQualifierMiss(norm, job);
             norm = vetoGeoRegion(norm, job, geoMarkets);
             norm = vetoNotes(norm, job);
