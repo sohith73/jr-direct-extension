@@ -2590,16 +2590,45 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
         return decision;
     }
 
+    // Deterministic PRE-SKIP before batching (cost saver). The intern,
+    // excluded-role, geo-region and operator-note vetoes are PURE title/company
+    // checks — they flip a pick to skip regardless of what the AI says. Run
+    // them up front so a deterministically-excluded job never costs an OpenAI
+    // batch slot. Survivors go to the LLM; the SAME veto chain re-runs post-LLM
+    // below (idempotent) so the softer qualifier-miss veto still applies to AI
+    // picks. NOTE: vetoQualifierMiss is intentionally NOT pre-applied — it's the
+    // "soften" path that should defer to the AI's judgement, not pre-empt it.
+    const preDecisions = [];
+    const toJudge = [];
+    for (const job of jobs) {
+        let seed = { id: job.jobId, pick: true, score: 0, reason: '', matchedRole: '', skipKind: '' };
+        seed = vetoExcluded(seed, job);
+        seed = vetoIntern(seed, job);
+        seed = vetoGeoRegion(seed, job, geoMarkets);
+        seed = vetoNotes(seed, job);
+        if (!seed.pick) {
+            // No AI ran — fix the "(Auto-vetoed; AI scored 0.)" tail wording.
+            seed.reason = seed.reason.replace(/\(Auto-vetoed; AI scored \d+\.\)/, '(Auto-skipped before AI — deterministic.)');
+            preDecisions.push(seed);
+            notifyPopup('decision', { decision: seed, job });
+        } else {
+            toJudge.push(job);
+        }
+    }
+    if (preDecisions.length) {
+        notifyPopup('ai-progress', { judged: preDecisions.length, total: jobs.length });
+    }
+
     // Batch in chunks of 8 — matches DEFAULTS.autoBatchSize so a single
     // auto-batch trigger maps to ONE OpenAI call (no internal split).
     // 8 jobs × 4500 char JDs ≈ 9k input tokens — still under gpt-4o-mini's
     // 8s typical latency window.
     const BATCH = 8;
-    const decisions = [];
+    const decisions = [...preDecisions];
     const jobsById = new Map(jobs.map((j) => [j.jobId, j]));
-    const totalBatches = Math.ceil(jobs.length / BATCH);
-    for (let i = 0; i < jobs.length; i += BATCH) {
-        const batch = jobs.slice(i, i + BATCH);
+    const totalBatches = Math.ceil(toJudge.length / BATCH);
+    for (let i = 0; i < toJudge.length; i += BATCH) {
+        const batch = toJudge.slice(i, i + BATCH);
         const batchIndex = Math.floor(i / BATCH) + 1;
         notifyPopup('ai-batch-start', {
             batchIndex,
