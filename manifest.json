@@ -1,14 +1,18 @@
 {
   "manifest_version": 3,
-  "name": "FlashFire JR + Indeed → Dashboard Direct",
-  "version": "1.29.0.4",
-  "description": "Scrape jobright.ai AND Indeed job listings from the DOM as you scroll, AI-judge in-extension against the client summary, and push picks straight to the FlashFire dashboard.",
+  "name": "FlashFire JR + Indeed + Reed + Flexa → Dashboard Direct",
+  "version": "1.31.1.0",
+  "description": "Scrape jobright.ai, Indeed, Reed (reed.co.uk) AND Flexa (flexa.careers) job listings from the DOM as you scroll, AI-judge in-extension against the client summary, and push picks straight to the FlashFire dashboard.",
   "permissions": ["storage", "activeTab", "tabs", "scripting"],
   "host_permissions": [
     "https://jobright.ai/*",
     "https://*.jobright.ai/*",
     "https://*.indeed.com/*",
     "https://indeed.com/*",
+    "https://*.reed.co.uk/*",
+    "https://reed.co.uk/*",
+    "https://flexa.careers/*",
+    "https://*.flexa.careers/*",
     "https://api.openai.com/*",
     "http://*/*",
     "https://*/*"
@@ -18,7 +22,7 @@
     "type": "module"
   },
   "action": {
-    "default_title": "Toggle FlashFire Panel (JR + Indeed)"
+    "default_title": "Toggle FlashFire Panel (JR + Indeed + Reed + Flexa)"
   },
   "content_scripts": [
     {
@@ -39,6 +43,18 @@
       "js": ["content-scrape-indeed.js"],
       "run_at": "document_idle",
       "all_frames": false
+    },
+    {
+      "matches": ["https://*.reed.co.uk/*", "https://reed.co.uk/*"],
+      "js": ["content-scrape-reed.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://flexa.careers/*", "https://*.flexa.careers/*"],
+      "js": ["content-scrape-flexa.js"],
+      "run_at": "document_idle",
+      "all_frames": false
     }
   ],
   "web_accessible_resources": [
@@ -48,7 +64,11 @@
         "https://jobright.ai/*",
         "https://*.jobright.ai/*",
         "https://*.indeed.com/*",
-        "https://indeed.com/*"
+        "https://indeed.com/*",
+        "https://*.reed.co.uk/*",
+        "https://reed.co.uk/*",
+        "https://flexa.careers/*",
+        "https://*.flexa.careers/*"
       ]
     }
   ]

@@ -1199,8 +1199,8 @@ async function startCapture() {
         captureActive = true;
         captureCount = 0;
         applyState();
-        setMessage('Capture started. Open jobright.ai/jobs/recommend and scroll.', 'ok');
-        setLive('Capturing', 'Scroll JR — auto-pipeline kicks off every batch.');
+        setMessage('Capture started. Open jobright.ai/jobs/recommend — it auto-scrolls until the cap.', 'ok');
+        setLive('Capturing', 'Auto-scrolling JR — auto-pipeline kicks off every batch.');
     } else { setMessage('Failed to start capture.', 'error'); }
 }
 
@@ -1346,12 +1346,27 @@ chrome.runtime.onMessage.addListener((msg) => {
             if (msg.added > 0) {
                 setMessage(`+${msg.added} captured (total ${msg.count}).`, 'ok');
                 if (captureActive) {
-                    setLive('Capturing', `${msg.count} job${msg.count === 1 ? '' : 's'} in buffer · scroll for more`);
+                    setLive('Capturing', `${msg.count} job${msg.count === 1 ? '' : 's'} in buffer · auto-scrolling for more`);
                 }
             }
             break;
+        case 'reed-paging':
+            // Reed is page-based — the content script fetches pages in the
+            // background. Show the operator it's working (and to wait).
+            setLive('Paging Reed', msg.text || 'Auto-capturing more Reed pages — please wait…', 'active');
+            break;
+        case 'flexa-paging':
+            // Flexa is "Load More" based — the content script clicks it in the
+            // background. Show the operator it's working (and to wait).
+            setLive('Loading Flexa', msg.text || 'Auto-capturing more Flexa jobs — please wait…', 'active');
+            break;
+        case 'jr-paging':
+            // JobRight auto-scrolls the recommendations list on its own while
+            // capturing — the operator no longer has to scroll by hand.
+            setLive('Auto-scrolling', msg.text || 'Auto-scrolling JobRight for more jobs — please wait…', 'active');
+            break;
         case 'source-blocked': {
-            const pretty = (s) => s === 'jobright' ? 'JobRight' : s === 'indeed' ? 'Indeed' : (s || 'this site');
+            const pretty = (s) => s === 'jobright' ? 'JobRight' : s === 'indeed' ? 'Indeed' : s === 'reed' ? 'Reed' : s === 'flexa' ? 'Flexa' : (s || 'this site');
             const allowed = (msg.allowed || ['jobright']).map(pretty).join(' / ');
             const site = pretty(msg.source);
             const hint = (msg.allowed || []).includes('jobright')
@@ -1415,6 +1430,35 @@ chrome.runtime.onMessage.addListener((msg) => {
                     els.judge.classList.add('start-armed');
                     setTimeout(() => els.judge?.classList.remove('start-armed'), 2400);
                 }
+            }
+            if (msg.phase === 'auto-cycle-flushing') {
+                // Auto-run: 100-buffer full — flushing (judge + push) before the
+                // next 100. Capture stays "active" from the operator's view.
+                pushTickerLine(`⟳ batch ${msg.batch}: buffer full — flushing (judge + push)…`, 'batch');
+                setLive('Auto-run', `Batch ${msg.batch}: pushing this 100, then capturing the next…`, 'active');
+            }
+            if (msg.phase === 'auto-cycle') {
+                // Flushed + reset; capturing resumes automatically.
+                captureActive = true;
+                applyState();
+                const s = msg.stats || {};
+                pushTickerLine(`✓ batch ${msg.batch} pushed (picks ${s.picks || 0}) — capturing next 100…`, 'push');
+                setMessage(`Auto-run: batch ${msg.batch} done — continuing to the next 100.`, 'ok');
+                setLive('Auto-run', `Batch ${msg.batch} pushed · auto-scrolling for the next 100…`, 'active');
+            }
+            if (msg.phase === 'session-complete') {
+                captureActive = false;
+                applyState();
+                const s = msg.stats || {};
+                const why = msg.reason === 'cap-hit' ? 'client target reached'
+                    : msg.reason === 'exhausted' ? 'no more JobRight recommendations'
+                    : msg.reason === 'max-batches' ? 'safety limit reached'
+                    : msg.reason === 'judge-halted' ? 'judging paused on errors'
+                    : 'finished';
+                setMessage(`Auto-run complete — ${why}. ${msg.batches || 0} batch${(msg.batches || 0) === 1 ? '' : 'es'} pushed.`, 'ok');
+                pushTickerLine(`■ auto-run complete (${why}) — ${msg.batches || 0} batches`, 'push');
+                setLive('Auto-run complete', `${why} · ${msg.batches || 0} batches pushed.`, 'success');
+                hideLive(4000);
             }
             if (msg.phase === 'cap-hit') {
                 // Server-side client cap (targetJobCount) reached. Hard halt:

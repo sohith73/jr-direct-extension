@@ -18,6 +18,12 @@ const DEFAULTS = {
     // automatically as the operator scrolls. Triggers a batch every
     // `autoBatchSize` newly captured jobs. No manual Push needed.
     autoMode: true,
+    // Auto-run to end: when true (and autoMode is on), reaching the 100-capture
+    // buffer cap no longer stops the session. The SW flushes (judge + push) the
+    // batch, clears the buffer, and resumes capturing the NEXT 100 — looping
+    // until the client target is reached or JobRight's recommendation list ends.
+    // Turn off to keep the old behaviour: fill 100, then wait for the operator.
+    autoRun: true,
     autoBatchSize: 8,
     autoPushConcurrency: 3,
     // OpenAI direct-call config — must be in DEFAULTS so loadConfig() pulls
@@ -91,14 +97,41 @@ const state = {
         // every push silently failing.
         capHit: false,
         capInfo: null, // { targetJobCount, current, remaining } from server
+        // ── Auto-run-to-end cycle (see DEFAULTS.autoRun) ──────────────────
+        // exhausted  — content script reported JobRight's list has no more jobs.
+        // cycleBusy  — a flush→reset→resume cycle is mid-flight (single-flight).
+        // cycleBatches — how many 100-buffers we've flushed this run (safety cap).
+        // cycleDone  — finishAutoRun already ran (idempotency for the two callers:
+        //              cap-hit and list-exhausted can race).
+        exhausted: false,
+        cycleBusy: false,
+        cycleBatches: 0,
+        cycleDone: false,
     },
 };
+
+// Safety ceiling on the auto-run loop — ~4000 jobs. Normal termination is the
+// client target (capHit) or the end of the recommendation list (exhausted);
+// this only backstops a pathological list that never stops yielding "new" cards.
+const MAX_CYCLE_BATCHES = 40;
 
 const PERSIST_KEYS = {
     captureActive: 'jrd_capture_active',
     captureJobs: 'jrd_capture_jobs',
     captureStartedAt: 'jrd_capture_startedAt',
     judged: 'jrd_judged',
+    // Chrome evicts an MV3 service worker after ~30s idle and `state` is rebuilt
+    // from its literal. These two MUST survive that, or the session-stat POST
+    // lies about the day's work:
+    //   sessionId — without it the next heartbeat posts sessionId:'' , the
+    //     backend falls out of its upsert branch into create(), and a SECOND row
+    //     appears for the SAME capture session carrying the same restored
+    //     cumulative capture count. The daily sum then counts every pre-eviction
+    //     job twice, which is what made the milestone totals read high.
+    //   autoStats — holds judged/picks/pushed and modelStats (the real token
+    //     counts the cost report is priced from). Losing it silently zeroes them.
+    captureSessionId: 'jrd_capture_sessionId',
+    autoStats: 'jrd_auto_stats',
 };
 const TODAY_KEY = 'jrd_today_metrics';
 
@@ -175,6 +208,8 @@ async function persistCapture() {
             [PERSIST_KEYS.captureActive]: state.capture.active,
             [PERSIST_KEYS.captureStartedAt]: state.capture.startedAt,
             [PERSIST_KEYS.captureJobs]: [...state.capture.jobs.entries()],
+            [PERSIST_KEYS.captureSessionId]: state.capture.sessionId || '',
+            [PERSIST_KEYS.autoStats]: state.auto.stats || {},
         });
     } catch (e) { console.warn('[FF-JRD] persistCapture failed', e?.message); }
 }
@@ -203,6 +238,14 @@ async function restoreState() {
         if (s[PERSIST_KEYS.judged] && typeof s[PERSIST_KEYS.judged] === 'object') {
             state.judged = s[PERSIST_KEYS.judged];
         }
+        if (typeof s[PERSIST_KEYS.captureSessionId] === 'string' && s[PERSIST_KEYS.captureSessionId]) {
+            state.capture.sessionId = s[PERSIST_KEYS.captureSessionId];
+        }
+        if (s[PERSIST_KEYS.autoStats] && typeof s[PERSIST_KEYS.autoStats] === 'object') {
+            // Restore judged/picks/pushed AND modelStats so the token counts the
+            // cost report prices are not reset to zero by an SW eviction.
+            state.auto.stats = { ...state.auto.stats, ...s[PERSIST_KEYS.autoStats] };
+        }
         if (state.capture.jobs.size > 0) setBadge(state.capture.jobs.size);
         console.log('[FF-JRD] restored state', {
             captured: state.capture.jobs.size,
@@ -229,9 +272,9 @@ chrome.runtime.onConnect.addListener((port) => {
 chrome.action.onClicked.addListener(async (tab) => {
     if (!tab?.id) return;
     const url = tab.url || '';
-    if (!/^https?:\/\/([^/]+\.)?(jobright\.ai|indeed\.com)\//.test(url)) {
+    if (!/^https?:\/\/([^/]+\.)?(jobright\.ai|indeed\.com|reed\.co\.uk|flexa\.careers)\//.test(url)) {
         // Not on a supported tab — open JR by default; the operator can
-        // navigate to Indeed themselves (both are supported).
+        // navigate to Indeed / Reed / Flexa themselves (all four are supported).
         await chrome.tabs.create({ url: 'https://jobright.ai/jobs/recommend' });
         return;
     }
@@ -303,9 +346,11 @@ const AUTO_JUDGE_MAX_FAILS = 3; // consecutive judge failures before halting aut
 const AUTO_MIN_JD_LEN = 80;     // Indeed jobs with a shorter JD are skipped, not added
 
 // allowedSourcesForCapture: the per-client scrape-source allowlist
-// ('jobright' / 'indeed') from the selected client's profile. Default is
-// JobRight-only when the client hasn't picked any source — so a client is
-// never scraped from a site the operator didn't enable for them. Set in
+// ('jobright' / 'indeed' / 'reed' / 'flexa') from the selected client's
+// profile. Default is JobRight-only when the client hasn't picked any source —
+// so a client is never scraped from a site the operator didn't enable for them.
+// Every source (including Reed + Flexa) is gated per-client: un-checking a site
+// in the portal stops the extension capturing its cards for that client. Set in
 // clients-tracking → AI Summary tab → "Scrape sources".
 function allowedSourcesForCapture() {
     const raw = state.config.authProfile?.scrapeSources;
@@ -320,7 +365,7 @@ function allowedSourcesForCapture() {
 // detection for any legacy/in-flight card that predates the tag.
 function jobSource(j) {
     const s = String(j?.source || '').toLowerCase().trim();
-    if (s === 'jobright' || s === 'indeed') return s;
+    if (s === 'jobright' || s === 'indeed' || s === 'reed' || s === 'flexa') return s;
     if (j?.jrLink || j?.matchPercent != null || j?.fitFlag) return 'jobright';
     if (j?.easyApply != null || j?.description != null) return 'indeed';
     return 'jobright';
@@ -360,9 +405,16 @@ function ingestCards(jobs) {
         // Indeed: drop Easy Apply (Indeed-hosted) postings — operator wants
         // only direct company-site jobs. JR jobs have no easyApply field.
         if (j.easyApply) { dropped += 1; continue; }
+        // Buffer full. In MANUAL mode, drop the overflow (the operator will
+        // flush + restart). In an AUTO-RUN, do NOT drop: the content script has
+        // already marked these jobIds "seen" and won't re-send them, so dropping
+        // would lose them for good. Accept the overflow instead — flushAutoBatch
+        // handles any count, and the cycle resets the buffer right after.
         if (state.capture.jobs.size >= MAX_CAPTURES) {
-            dropped += 1;
-            continue;
+            const autoRunning =
+                state.config.autoMode !== false && state.config.autoRun !== false &&
+                !state.auto.capHit && !state.auto.exhausted && !state.auto.cycleDone;
+            if (!autoRunning) { dropped += 1; continue; }
         }
         // Indeed JD can carry leaked styled-components CSS — scrub to plain
         // text before storing so the judge + dashboard never see HTML/CSS.
@@ -372,6 +424,8 @@ function ingestCards(jobs) {
         // Indeed: kick off async resolution of the applystart redirect →
         // original employer URL so the panel "View" link shows it directly.
         if (INDEED_REDIRECT_RX.test(String(j.applyUrl || ''))) enqueueIndeedResolve(j.jobId);
+        // Reed: resolve the login-gated /apply redirect → original employer URL.
+        if (jobSource(j) === 'reed' && isReedHost(String(j.applyUrl || ''))) enqueueReedResolve(j.jobId);
     }
     setBadge(state.capture.jobs.size);
     notifyPopup('count', {
@@ -387,12 +441,24 @@ function ingestCards(jobs) {
         notifyPopup('source-blocked', { source: blockedSrc, allowed: allowedSources, dropped: sourceBlocked });
     }
     if (state.capture.jobs.size >= MAX_CAPTURES) {
-        // Reaching cap auto-stops capture so the pipeline drains and the
-        // operator gets a clean "session done" signal.
+        // Reaching the 100-buffer cap pauses ingest so the pipeline drains.
         if (state.capture.active) {
             state.capture.active = false;
             persistCapture();
-            notifyPopup('phase', { phase: 'cap-reached', cap: MAX_CAPTURES });
+            const autoRunning =
+                state.config.autoMode !== false &&
+                state.config.autoRun !== false &&
+                !state.auto.capHit &&
+                !state.auto.exhausted &&
+                !state.auto.cycleDone;
+            if (autoRunning) {
+                // Auto-run: flush this 100, then reset + resume the next 100.
+                notifyPopup('phase', { phase: 'auto-cycle-flushing', batch: state.auto.cycleBatches + 1, cap: MAX_CAPTURES });
+                runAutoCycleBatch();
+            } else {
+                // Manual mode: stop and wait for the operator to flush + restart.
+                notifyPopup('phase', { phase: 'cap-reached', cap: MAX_CAPTURES });
+            }
         }
     }
     if (added > 0) persistCapture();
@@ -1302,7 +1368,7 @@ async function pumpTabResolve() {
 // follow the full redirect chain, grabs the FIRST off-indeed.com URL it
 // lands on (= the employer / ATS site), then closes the tab. Needs the
 // "tabs" permission to read tab.url. Resolves '' on timeout / no escape.
-function resolveViaTab(seedUrl) {
+function resolveViaTab(seedUrl, isPlatformHost = isIndeedHost) {
     return new Promise((resolve) => {
         let settled = false;
         let createdTabId = null;
@@ -1317,7 +1383,7 @@ function resolveViaTab(seedUrl) {
         const onUpdated = (tabId, changeInfo, tab) => {
             if (tabId !== createdTabId) return;
             const u = changeInfo.url || (tab && tab.url) || '';
-            if (u && /^https?:/i.test(u) && !isIndeedHost(u)) finish(u);
+            if (u && /^https?:/i.test(u) && !isPlatformHost(u)) finish(u);
         };
         const timer = setTimeout(() => finish(''), 25000);
         try {
@@ -1325,13 +1391,13 @@ function resolveViaTab(seedUrl) {
             chrome.tabs.create({ url: seedUrl, active: false }, (tab) => {
                 if (chrome.runtime.lastError || !tab) { finish(''); return; }
                 createdTabId = tab.id;
-                // Safety net in case the off-indeed navigation fired before
+                // Safety net in case the off-platform navigation fired before
                 // the listener attached.
                 setTimeout(() => {
                     if (settled || createdTabId == null) return;
                     chrome.tabs.get(createdTabId, (t) => {
                         if (chrome.runtime.lastError || !t) return;
-                        if (t.url && /^https?:/i.test(t.url) && !isIndeedHost(t.url)) finish(t.url);
+                        if (t.url && /^https?:/i.test(t.url) && !isPlatformHost(t.url)) finish(t.url);
                     });
                 }, 1800);
             });
@@ -1342,12 +1408,140 @@ function resolveViaTab(seedUrl) {
     });
 }
 
+// ---- Reed external-apply resolution ---------------------------------------
+// Reed redirect jobs (isRedirect) hide the employer URL behind a login-gated
+// /apply redirect. The operator is signed into reed.co.uk, so we resolve it
+// the same way as Indeed: try a credentialed SW fetch that follows the
+// redirect chain off reed.co.uk; if that can't escape (JS-driven redirect /
+// interstitial), fall back to opening <jobUrl>/apply in a background tab and
+// grabbing the first off-reed URL it lands on. Falls back to the canonical
+// Reed job URL (still scrapeable + applyable) when no employer URL is found.
+const reedApplyCache = new Map(); // jobId -> resolved employer URL ('' = tried, none)
+function isReedHost(url) {
+    try { return /(^|\.)reed\.co\.uk$/i.test(new URL(url).hostname); }
+    catch { return false; }
+}
+function reedApplySeed(reedJobUrl) {
+    const base = String(reedJobUrl || '').replace(/[?#].*$/, '').replace(/\/+$/, '');
+    return base ? `${base}/apply` : '';
+}
+async function resolveReedApplyUrl(jobId, reedJobUrl) {
+    if (jobId && reedApplyCache.has(jobId)) return reedApplyCache.get(jobId);
+    let result = '';
+    const seed = reedApplySeed(reedJobUrl);
+    if (seed) {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 9000);
+        try {
+            const res = await fetch(seed, { redirect: 'follow', credentials: 'include', signal: ctrl.signal });
+            const finalUrl = res.url || '';
+            if (finalUrl && !isReedHost(finalUrl)) result = finalUrl;
+        } catch (e) {
+            console.warn('[FF-REED] applyUrl resolve failed', jobId, e?.message);
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+    if (jobId) reedApplyCache.set(jobId, result);
+    return result;
+}
+function applyResolvedReedUrl(jobId, finalUrl) {
+    if (!finalUrl) return;
+    const j = state.capture.jobs.get(jobId);
+    if (j) j.applyUrl = finalUrl;
+    const jj = state.judged?.jobs?.find((x) => x.jobId === jobId);
+    if (jj) jj.applyUrl = finalUrl;
+    if (!isReedHost(finalUrl)) reedApplyCache.set(jobId, finalUrl);
+    notifyPopup('applyurl-resolved', { jobId, applyUrl: finalUrl });
+}
+
+const reedResolveQueue = [];
+let reedResolveActive = 0;
+const REED_RESOLVE_CONCURRENCY = 3;
+function enqueueReedResolve(jobId) {
+    if (!jobId) return;
+    reedResolveQueue.push(jobId);
+    pumpReedResolve();
+}
+function pumpReedResolve() {
+    while (reedResolveActive < REED_RESOLVE_CONCURRENCY && reedResolveQueue.length) {
+        const jobId = reedResolveQueue.shift();
+        const job = state.capture.jobs.get(jobId);
+        if (!job) continue;
+        const reedUrl = String(job.applyUrl || '');
+        if (!isReedHost(reedUrl)) continue; // already resolved to employer
+        reedResolveActive += 1;
+        resolveReedApplyUrl(jobId, reedUrl)
+            .then((original) => {
+                if (original) applyResolvedReedUrl(jobId, original);
+                else enqueueReedTabResolve(jobId, reedUrl);
+            })
+            .catch(() => {})
+            .finally(() => {
+                reedResolveActive -= 1;
+                pumpReedResolve();
+            });
+    }
+}
+
+// Sequential tab-resolve queue for Reed — at most ONE background tab at a time,
+// and never while the operator is actively scrolling (mirrors the Indeed one).
+const reedTabQueue = [];
+let reedTabBusy = false;
+function enqueueReedTabResolve(jobId, reedUrl) {
+    if (!jobId) return;
+    if (reedTabQueue.some((q) => q.jobId === jobId)) return;
+    reedTabQueue.push({ jobId, reedUrl });
+    pumpReedTabResolve();
+}
+async function pumpReedTabResolve() {
+    if (reedTabBusy) return;
+    if (state.capture.active) { setTimeout(pumpReedTabResolve, 4000); return; }
+    reedTabBusy = true;
+    try {
+        while (reedTabQueue.length) {
+            if (state.capture.active) break;
+            const { jobId, reedUrl } = reedTabQueue.shift();
+            const seed = reedApplySeed(reedUrl);
+            const original = seed ? await resolveViaTab(seed, isReedHost) : '';
+            // No off-reed escape → keep the canonical Reed job URL.
+            applyResolvedReedUrl(jobId, original || reedUrl);
+        }
+    } finally {
+        reedTabBusy = false;
+        if (reedTabQueue.length) setTimeout(pumpReedTabResolve, 4000);
+    }
+}
+
 // On-demand original-URL resolution for one job (panel "Get original" click).
 async function resolveApplyOnDemand(jobId) {
     if (!jobId) return { ok: false, error: 'BAD_INPUT' };
     const job = state.capture.jobs.get(jobId)
         || (state.judged?.jobs || []).find((x) => x.jobId === jobId);
     const cur = String(job?.applyUrl || '');
+    // Reed: resolve the login-gated /apply redirect → employer URL on demand
+    // (opens <jobUrl>/apply in a background tab in the operator's session).
+    if (job?.source === 'reed') {
+        if (cur && !isReedHost(cur)) {
+            return { ok: true, applyUrl: cur, resolved: true, cached: true };
+        }
+        const seedTab = reedApplySeed(cur);
+        const original = seedTab ? await resolveViaTab(seedTab, isReedHost) : '';
+        if (original) {
+            const j = state.capture.jobs.get(jobId);
+            if (j) j.applyUrl = original;
+            const jj = state.judged?.jobs?.find((x) => x.jobId === jobId);
+            if (jj) jj.applyUrl = original;
+            reedApplyCache.set(jobId, original);
+            persistCapture();
+        }
+        return { ok: !!original, applyUrl: original || cur, resolved: !!original };
+    }
+    // Flexa: the apply URL captured in-page is already the original employer URL
+    // (Flexa publishes it on the detail page). Nothing to resolve on demand.
+    if (job?.source === 'flexa') {
+        return { ok: true, applyUrl: cur, resolved: true, cached: true };
+    }
     // If it's already a resolved employer URL, nothing to do.
     if (cur && !isIndeedHost(cur)) {
         return { ok: true, applyUrl: cur, resolved: true, cached: true };
@@ -1399,6 +1593,26 @@ async function resolveJobDetail(jobId) {
             captured.applyUrl = applyLink;
         }
         return { ok: true, applyLink, description: String(captured.description || ''), meta: {}, cached: true };
+    }
+    // Reed is self-contained too: the content script already scraped the full
+    // JD in-page (from __NEXT_DATA__). Resolve the /apply redirect → employer
+    // URL here (falls back to the canonical Reed job URL) and hand back the
+    // captured JD. Never route Reed through the JR scraper (wrong jobId space).
+    if (captured && captured.source === 'reed') {
+        let applyLink = capturedApplyUrl;
+        if (isReedHost(applyLink)) {
+            const original = await resolveReedApplyUrl(jobId, applyLink);
+            applyLink = original || applyLink; // stays reed.co.uk if unresolved (still scrapeable)
+            captured.applyUrl = applyLink;
+        }
+        return { ok: true, applyLink, description: String(captured.description || ''), meta: {}, cached: true };
+    }
+    // Flexa is fully self-contained: the content script already scraped the full
+    // JD (JobPosting ld+json) AND the ORIGINAL employer apply URL in-page — the
+    // apply URL is public on the detail page, nothing to resolve. Never route
+    // Flexa through the JR scraper (wrong jobId space) — hand back what we have.
+    if (captured && captured.source === 'flexa') {
+        return { ok: true, applyLink: capturedApplyUrl, description: String(captured.description || ''), meta: {}, cached: true };
     }
     if (captured && isDirectEmployerUrl(capturedApplyUrl)) {
         const capturedDescLen = String(captured.description || '').length;
@@ -2674,6 +2888,11 @@ async function aiJudge({ profile, jobs, threshold, aiSummary = '' }) {
         _ms.inputTokens += Number(_u.prompt_tokens) || 0;
         _ms.outputTokens += Number(_u.completion_tokens) || 0;
         _ms.cachedTokens += Number(_u.prompt_tokens_details?.cached_tokens) || 0; // billed at 50%
+        // Flush to storage.session immediately. A judge batch can be the last
+        // thing that happens before Chrome evicts the SW (~30s idle), and these
+        // token counts are what the cost report is priced from — losing them
+        // would silently under-report the day's spend.
+        persistCapture().catch(() => {});
         const content = data?.choices?.[0]?.message?.content || '{}';
         let parsed = null;
         try { parsed = JSON.parse(content); } catch { /* ignore */ }
@@ -3095,6 +3314,86 @@ async function flushAutoBatch() {
     }
 }
 
+// ── Auto-run-to-end cycle ────────────────────────────────────────────
+// softResetBuffer: empty the capture buffer for the NEXT 100 while a run
+// continues. Distinct from jrd-start-capture in two deliberate ways:
+//   • it does NOT tell the content script to clear its in-page `seen` set, so
+//     the scraper keeps scrolling DOWN and only sends genuinely-new cards
+//     (clearing it would re-scrape the same 100 we just pushed), and
+//   • it mints a fresh sessionId + startedAt so each flushed batch is its own
+//     /extension/session-stat row. mergeSessionRows groups by startedAt, so
+//     distinct timestamps make the daily capture total the SUM of all batches,
+//     never just the last one.
+function softResetBuffer() {
+    state.capture.jobs = new Map();
+    state.capture.linkedinSkipped = new Map();
+    state.judged = null;
+    state.auto.processed = new Set();
+    state.auto.stats = { judged: 0, picks: 0, pushed: 0, dupes: 0, blocked: 0, errors: 0, skipsByKind: {} };
+    state.capture.sessionId =
+        (crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+    state.capture.startedAt = new Date().toISOString();
+    chrome.storage.session.remove(PERSIST_KEYS.judged).catch(() => {});
+    setBadge(0);
+}
+
+// finishAutoRun: end the whole auto-run. Idempotent — cap-hit and
+// list-exhausted can both fire, and only the first should notify.
+// Does NOT report a session row: the final batch is reported exactly once by
+// its caller (runAutoCycleBatch or the exhausted handler) BEFORE this runs, so
+// reporting here too would upsert the same sessionId row a second time.
+function finishAutoRun(reason) {
+    if (state.auto.cycleDone) return;
+    state.auto.cycleDone = true;
+    state.capture.active = false;
+    persistCapture().catch(() => {});
+    console.log('[FF-JRD] auto-run complete:', reason, 'batches=', state.auto.cycleBatches);
+    notifyPopup('phase', {
+        phase: 'session-complete',
+        reason,
+        batches: state.auto.cycleBatches,
+        stats: { ...state.auto.stats },
+        capInfo: state.auto.capInfo,
+    });
+}
+
+// runAutoCycleBatch: fired when the 100-buffer fills during an auto-run. Flush
+// (judge + push) the batch, then either stop (target reached / list ended /
+// safety ceiling) or soft-reset and resume capturing the next 100.
+async function runAutoCycleBatch() {
+    if (state.auto.cycleBusy || state.auto.cycleDone) return;
+    state.auto.cycleBusy = true;
+    try {
+        // Report BEFORE the soft-reset: reportSessionStat snapshots captures +
+        // stats synchronously (before its first await), so calling it now — then
+        // clearing — records the full 100-job batch, not an emptied buffer.
+        await flushAutoBatch();
+        reportSessionStat('flush').catch(() => {});
+        state.auto.cycleBatches += 1;
+
+        if (state.auto.capHit) { finishAutoRun('cap-hit'); return; }
+        if (state.auto.exhausted) { finishAutoRun('exhausted'); return; }
+        if (state.auto.halted) { finishAutoRun('judge-halted'); return; }
+        if (state.auto.cycleBatches >= MAX_CYCLE_BATCHES) { finishAutoRun('max-batches'); return; }
+
+        // Resume: empty buffer, keep scraping. Content script (still polling
+        // jrd-is-capturing) sees active flip back to true and resumes scrolling.
+        softResetBuffer();
+        state.capture.active = true;
+        persistCapture();
+        notifyPopup('phase', {
+            phase: 'auto-cycle',
+            batch: state.auto.cycleBatches,
+            capInfo: state.auto.capInfo,
+            stats: { ...state.auto.stats },
+        });
+    } catch (e) {
+        console.warn('[FF-JRD] runAutoCycleBatch threw', e?.message);
+    } finally {
+        state.auto.cycleBusy = false;
+    }
+}
+
 // reportSessionStat: POST one row to /extension/session-stat so the AI
 // Summaries admin page can render per-operator + per-client work-volume
 // without scraping the extension's local state. Fire-and-forget — never
@@ -3373,6 +3672,32 @@ function dispatchMessage(msg, _sender, sendResponse) {
         return false;
     }
 
+    // Reed's content-script pager polls this so it only fetches more SERP
+    // pages while a capture is running AND the cap isn't reached.
+    if (msg.type === 'jrd-is-capturing') {
+        const atCap = state.capture.jobs.size >= MAX_CAPTURES || !!state.auto.capHit;
+        sendResponse({ active: !!state.capture.active, atCap });
+        return true;
+    }
+
+    // Reed pager progress → relay to the panel as a live status line.
+    if (msg.type === 'jrd-reed-status') {
+        notifyPopup('reed-paging', { text: String(msg.text || '') });
+        return false;
+    }
+
+    // Flexa "Load More" pager progress → relay to the panel as a live status line.
+    if (msg.type === 'jrd-flexa-status') {
+        notifyPopup('flexa-paging', { text: String(msg.text || '') });
+        return false;
+    }
+
+    // JobRight auto-scroll progress → relay to the panel as a live status line.
+    if (msg.type === 'jrd-jr-status') {
+        notifyPopup('jr-paging', { text: String(msg.text || '') });
+        return false;
+    }
+
     if (msg.type === 'jrd-linkedin-skipped') {
         let added = 0;
         for (const j of msg.jobs || []) {
@@ -3536,6 +3861,11 @@ function dispatchMessage(msg, _sender, sendResponse) {
         state.auto.judgeFailStreak = 0;
         state.auto.halted = false;
         state.auto.haltedReason = '';
+        // Fresh auto-run cycle.
+        state.auto.exhausted = false;
+        state.auto.cycleBusy = false;
+        state.auto.cycleBatches = 0;
+        state.auto.cycleDone = false;
         // capHit is NOT reset here — it tracks server-side state, not session.
         // Operator must raise the cap on the dashboard to clear it (refreshCapInfo
         // re-runs on push success / panel reopen).
@@ -3545,7 +3875,7 @@ function dispatchMessage(msg, _sender, sendResponse) {
         // Tell content script to clear its in-page cache so a re-scroll
         // re-emits cards instead of the de-dup squelching them.
         chrome.tabs
-            .query({ url: ['https://jobright.ai/*', 'https://*.jobright.ai/*', 'https://*.indeed.com/*', 'https://indeed.com/*'] })
+            .query({ url: ['https://jobright.ai/*', 'https://*.jobright.ai/*', 'https://*.indeed.com/*', 'https://indeed.com/*', 'https://*.reed.co.uk/*', 'https://reed.co.uk/*', 'https://flexa.careers/*', 'https://*.flexa.careers/*'] })
             .then((tabs) => {
                 for (const t of tabs) {
                     chrome.tabs
@@ -3593,6 +3923,10 @@ function dispatchMessage(msg, _sender, sendResponse) {
         state.auto.judgeFailStreak = 0;
         state.auto.halted = false;
         state.auto.haltedReason = '';
+        state.auto.exhausted = false;
+        state.auto.cycleBusy = false;
+        state.auto.cycleBatches = 0;
+        state.auto.cycleDone = false;
         setBadge(0);
         chrome.storage.session.remove(Object.values(PERSIST_KEYS)).catch(() => {});
         sendResponse({ ok: true });
@@ -3615,6 +3949,35 @@ function dispatchMessage(msg, _sender, sendResponse) {
         chrome.storage.local.set({ autoMode: enabled }).catch(() => {});
         sendResponse({ ok: true, autoMode: enabled });
         if (enabled) tryAutoBatch();
+        return true;
+    }
+
+    if (msg.type === 'jrd-set-auto-run') {
+        const enabled = msg.enabled !== false;
+        state.config.autoRun = enabled;
+        chrome.storage.local.set({ autoRun: enabled }).catch(() => {});
+        sendResponse({ ok: true, autoRun: enabled });
+        return true;
+    }
+
+    // Content script reports JobRight's recommendation list is exhausted (its
+    // auto-scroll hit the bottom and no new cards appeared). End the auto-run:
+    // flush whatever partial buffer remains, then finish. Guarded so it fires
+    // once and never fights an in-flight cap-reached cycle.
+    if (msg.type === 'jrd-list-exhausted') {
+        state.auto.exhausted = true;
+        if (!state.auto.cycleBusy && !state.auto.cycleDone) {
+            const hasPartial = state.capture.jobs.size > 0 && !state.auto.capHit;
+            if (hasPartial) {
+                state.capture.active = false;
+                flushAutoBatch()
+                    .catch(() => {})
+                    .finally(() => { reportSessionStat('flush').catch(() => {}); finishAutoRun('exhausted'); });
+            } else {
+                finishAutoRun('exhausted');
+            }
+        }
+        sendResponse({ ok: true });
         return true;
     }
 

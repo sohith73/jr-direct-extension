@@ -319,6 +319,103 @@
         );
     }
 
+    // ---- auto-scroll (the operator no longer scrolls by hand) -----------
+    // JobRight's recommendations are a VIRTUALISED list: cards mount as they
+    // enter the viewport and unmount as they leave, and more pages append at the
+    // bottom as you approach it (infinite load — verified live: scrollHeight grew
+    // 5108 → 9988 as the list was scrolled, unique jobs 10 → 31). The page WINDOW
+    // does not scroll; the scroll lives in an inner container
+    // (#jobs-page-main-content, overflow-y:auto). So while a capture is running we
+    // nudge THAT container's scrollTop down; the existing MutationObserver harvests
+    // each newly-mounted card. Stops when the SW says the cap is hit, or when we
+    // reach the bottom and no new jobs appear after a few tries (end of list).
+    let autoScroll = true;         // disabled via jrd-set-auto-advance, re-armed on reset
+    let scrollTicks = 0;
+    let scrollStalls = 0;
+    let lastSeenSize = 0;
+    let scrollBusy = false;
+    let exhaustedSent = false;     // list-end signalled to the SW once per run
+    const SCROLL_INTERVAL_MS = 1200;
+    const SCROLL_STEP_FRAC = 0.8;   // 20% viewport overlap so no virtualised card is skipped
+    const MAX_SCROLL_STALLS = 4;    // bottom + no new jobs this many times → done
+    const MAX_SCROLL_TICKS = 800;   // safety ceiling; the cap (100) normally stops us first
+
+    // The real scroll container: prefer the known id, else the nearest
+    // vertically-scrollable ancestor of a card (never a hard-coded hashed class).
+    function findScroller() {
+        const byId = document.querySelector('#jobs-page-main-content');
+        if (byId && byId.scrollHeight > byId.clientHeight + 20) return byId;
+        const card = document.querySelector('div.job-card-flag-classname[id], div[class*="index_job-card__"][id]');
+        let el = card && card.parentElement;
+        while (el && el !== document.body) {
+            const oy = getComputedStyle(el).overflowY;
+            if (/(auto|scroll)/.test(oy) && el.scrollHeight > el.clientHeight + 20) return el;
+            el = el.parentElement;
+        }
+        return null;
+    }
+
+    function captureState() {
+        return new Promise((resolve) => {
+            try { chrome.runtime.sendMessage({ type: 'jrd-is-capturing' }, (r) => resolve(r || {})); }
+            catch { resolve({}); }
+        });
+    }
+    function reportStatus(text) {
+        try { chrome.runtime.sendMessage({ type: 'jrd-jr-status', text }).catch(() => {}); } catch { /* reloaded */ }
+    }
+
+    async function maybeScroll() {
+        if (!autoScroll || scrollBusy) return;
+        if (scrollTicks >= MAX_SCROLL_TICKS) { autoScroll = false; return; }
+        scrollBusy = true;
+        try {
+            const st = await captureState();
+            if (!st.active) return;                 // only auto-scroll during a capture
+            if (st.atCap) {
+                autoScroll = false;
+                reportStatus('Auto-scroll stopped — capture cap reached.');
+                return;
+            }
+            const scroller = findScroller();
+            if (!scroller) return;                  // list not mounted yet; retry next tick
+
+            const grew = seen.size > lastSeenSize;
+            lastSeenSize = seen.size;
+            const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 8;
+            if (atBottom && !grew) {
+                // Give the infinite-loader a few ticks to append the next page
+                // before declaring the list finished.
+                scrollStalls += 1;
+                if (scrollStalls >= MAX_SCROLL_STALLS) {
+                    autoScroll = false;
+                    reportStatus(`Auto-scroll finished — reached the last recommendation (${seen.size} seen).`);
+                    // Tell the SW the list is exhausted so an auto-run stops
+                    // cleanly after flushing the final partial batch (instead of
+                    // waiting for a 100-buffer that will never fill).
+                    if (!exhaustedSent) {
+                        exhaustedSent = true;
+                        try { chrome.runtime.sendMessage({ type: 'jrd-list-exhausted' }).catch(() => {}); } catch { /* reloaded */ }
+                    }
+                    return;
+                }
+            } else {
+                scrollStalls = 0;
+            }
+
+            // Nudge down by <1 viewport (overlap avoids skipping cards that mount
+            // and unmount between ticks). Continues from wherever the operator
+            // left it, so a manual scroll is respected, never snapped away.
+            scroller.scrollTop += Math.round(scroller.clientHeight * SCROLL_STEP_FRAC);
+            scrollTicks += 1;
+            reportStatus(`Auto-scrolling for more jobs… (${seen.size} seen)`);
+            setTimeout(harvestVisible, 350);        // belt-and-braces alongside the observer
+        } finally {
+            scrollBusy = false;
+        }
+    }
+    setInterval(maybeScroll, SCROLL_INTERVAL_MS);
+
     // ---- panel injection (iframe loads sidepanel.html) -----------------
     const PANEL_ID = 'ff-jrd-panel';
     const PANEL_W = 420;
@@ -421,7 +518,18 @@
         if (!msg || typeof msg !== 'object') return false;
         if (msg.type === 'jrd-reset-content-cache') {
             seen.clear();
+            // Re-arm auto-scroll so a fresh Start scrolls from the top again.
+            autoScroll = true;
+            scrollTicks = 0;
+            scrollStalls = 0;
+            lastSeenSize = 0;
+            exhaustedSent = false;
             sendResponse({ ok: true });
+            return true;
+        }
+        if (msg.type === 'jrd-set-auto-advance') {
+            autoScroll = !!msg.enabled;
+            sendResponse({ ok: true, autoAdvance: autoScroll });
             return true;
         }
         if (msg.type === 'jrd-content-stats') {
